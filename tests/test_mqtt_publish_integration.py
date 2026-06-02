@@ -236,3 +236,40 @@ def test_mqtt_published_packet_legacy_mqtt_format_uses_singular_packet_topic():
     payload_dict = json.loads(captured[0]["payload"])
     # Duration still flows through correctly even on the legacy topic
     assert int(payload_dict["duration"]) > 0
+
+
+def test_mqtt_published_packet_direction_uses_transmitted_flag_for_tx():
+    """When engine marks packet_record.transmitted=True, published direction must be tx."""
+    config = _make_config(format_value="letsmesh", iata_code="LAX")
+    public_key_hex = "11" * 32
+    identity = _FakeIdentity(public_key_hex)
+
+    pusher = MeshCoreToMqttPusher(local_identity=identity, config=config)
+    captured = _attach_capturing_client(pusher.connections[0])
+
+    raw_bytes = bytes(range(12))
+    airtime_mgr = AirtimeManager(config)
+    packet_record = {
+        "timestamp": 1700000000.0,
+        "type": 8,
+        "route": 1,
+        "rssi": -88,
+        "snr": 6.0,
+        "score": 0.4,
+        "payload_length": 6,
+        "packet_hash": "FACEFEED" + "00" * 4,
+        "raw_packet": raw_bytes.hex(),
+        "airtime_ms": airtime_mgr.calculate_airtime(len(raw_bytes)),
+        "transmitted": True,
+    }
+
+    record = PacketRecord.from_packet_record(
+        packet_record, origin="test-node", origin_id=public_key_hex.upper()
+    )
+    assert record is not None
+
+    pusher.publish_packet(record.to_dict())
+
+    assert len(captured) == 1
+    payload_dict = json.loads(captured[0]["payload"])
+    assert payload_dict["direction"] == "tx"

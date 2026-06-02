@@ -1083,8 +1083,15 @@ class RepeaterDaemon:
                 route_type="flood",
             )
 
-            # Send via dispatcher
-            await self.dispatcher.send_packet(packet, wait_for_ack=False)
+            # Route advert TX through router injection so it flows through engine/storage/MQTT.
+            if not self.router:
+                logger.error("Cannot send advert: router not initialized")
+                return False
+
+            send_ok = await self.router.inject_packet(packet, wait_for_ack=False)
+            if not send_ok:
+                logger.error("Failed to inject advert packet for TX")
+                return False
 
             if self.repeater_handler:
                 self.repeater_handler.mark_seen(packet)

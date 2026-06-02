@@ -212,7 +212,7 @@ async def test_register_identity_everywhere_calls_helpers_and_respects_collision
 
 
 @pytest.mark.asyncio
-async def test_send_advert_branches_and_success_path():
+async def test_send_advert_branches_and_success_paths():
     daemon = RepeaterDaemon(_base_config(), radio=object())
 
     # Missing dispatcher/local identity
@@ -231,12 +231,19 @@ async def test_send_advert_branches_and_success_path():
         get_repeater_location=lambda: {"latitude": 9.1, "longitude": 8.2, "source": "gps"}
     )
 
+    # Router is now required for advert TX processing path.
+    daemon.router = None
+    assert await daemon.send_advert() is False
+
+    daemon.router = SimpleNamespace(inject_packet=AsyncMock(return_value=True))
+
     packet = SimpleNamespace(calculate_packet_hash=lambda: b"\xab" * 16)
     with patch("pymc_core.protocol.PacketBuilder.create_advert", return_value=packet):
         ok = await daemon.send_advert()
 
     assert ok is True
-    daemon.dispatcher.send_packet.assert_awaited_once_with(packet, wait_for_ack=False)
+    daemon.router.inject_packet.assert_awaited_once_with(packet, wait_for_ack=False)
+    daemon.dispatcher.send_packet.assert_not_called()
     daemon.repeater_handler.mark_seen.assert_called_once_with(packet)
     daemon.dispatcher.packet_filter.track_packet.assert_called_once()
 

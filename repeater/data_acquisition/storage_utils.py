@@ -70,7 +70,7 @@ class PacketRecord:
             origin_id=origin_id,
             timestamp=dt.isoformat(),
             type="PACKET",
-            direction="rx",
+            direction="tx" if bool(packet_record.get("transmitted", False)) else "rx",
             time=dt.strftime("%H:%M:%S"),
             date=dt.strftime("%-d/%-m/%Y"),
             len=str(len(packet_record["raw_packet"]) // 2),
