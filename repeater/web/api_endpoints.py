@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -2414,7 +2415,7 @@ class APIEndpoints:
 
                 normalized_config = None
                 try:
-                    normalized_config = _normalize_radios_config(json.loads(json.dumps(config_yaml)))
+                    normalized_config = _normalize_radios_config(copy.deepcopy(config_yaml))
                 except Exception as exc:
                     add_error("radios", f"Invalid radios configuration: {exc}")
 
