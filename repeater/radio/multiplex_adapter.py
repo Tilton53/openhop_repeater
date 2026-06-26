@@ -13,6 +13,7 @@ class MultiplexRadioAdapter:
     def __init__(self, manager: RadioManager):
         self.manager = manager
         self._receive_callback: Optional[Callable[..., Any]] = None
+        self._rx_callback: Optional[Callable[..., Any]] = None
 
     @property
     def endpoints(self) -> List[RadioEndpoint]:
@@ -26,13 +27,19 @@ class MultiplexRadioAdapter:
 
     def set_receive_callback(self, callback: Callable[..., Any]) -> None:
         self._receive_callback = callback
+        self._rx_callback = callback
         for endpoint in self.endpoints:
             backend = endpoint.backend
             if backend is None:
                 continue
-            setter = getattr(backend, "set_receive_callback", None)
+            setter = getattr(backend, "set_rx_callback", None)
+            if not callable(setter):
+                setter = getattr(backend, "set_receive_callback", None)
             if callable(setter):
                 setter(self._build_receive_wrapper(endpoint))
+
+    def set_rx_callback(self, callback: Callable[..., Any]) -> None:
+        self.set_receive_callback(callback)
 
     def send(self, packet: Any, **kwargs) -> Dict[str, Any]:
         return self.send_all(packet, **kwargs)

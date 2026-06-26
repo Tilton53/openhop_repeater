@@ -75,6 +75,24 @@ def test_multiplex_adapter_wraps_callbacks_with_origin_metadata():
     }
 
 
+def test_multiplex_adapter_set_rx_callback_aliases_set_receive_callback():
+    manager, backends = _manager_with_backends()
+    adapter = MultiplexRadioAdapter(manager)
+    received = []
+
+    def _callback(packet, *args, **kwargs):
+        received.append((packet, args, kwargs))
+
+    adapter.set_rx_callback(_callback)
+
+    packet = object()
+    backends["beta"].callback(packet, metadata={})
+
+    assert adapter._rx_callback is _callback
+    assert len(received) == 1
+    assert received[0][2]["metadata"]["origin_radio"] == "beta"
+
+
 def test_multiplex_adapter_send_all_uses_healthy_targets_only():
     manager, backends = _manager_with_backends()
     adapter = MultiplexRadioAdapter(manager)
