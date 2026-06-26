@@ -8,10 +8,11 @@ from repeater.radio.multiplex_adapter import MultiplexRadioAdapter
 
 
 class _Backend:
-    def __init__(self, *, healthy=True, rssi=-90, snr=7.5):
+    def __init__(self, *, healthy=True, rssi=-90, snr=7.5, noise_floor=-120):
         self._healthy = healthy
         self._rssi = rssi
         self._snr = snr
+        self._noise_floor = noise_floor
         self.callback = None
         self.sent_packets = []
 
@@ -23,6 +24,9 @@ class _Backend:
 
     def get_last_snr(self):
         return self._snr
+
+    def get_noise_floor(self):
+        return self._noise_floor
 
     def set_receive_callback(self, callback):
         self.callback = callback
@@ -36,14 +40,26 @@ def _manager_with_backends():
     backends = {}
 
     def _builder(cfg):
-        backend = _Backend(healthy=cfg["name"] != "degraded", rssi=cfg.get("rssi", -90), snr=cfg.get("snr", 7.5))
+        backend = _Backend(
+            healthy=cfg["name"] != "degraded",
+            rssi=cfg.get("rssi", -90),
+            snr=cfg.get("snr", 7.5),
+            noise_floor=cfg.get("noise_floor", -120),
+        )
         backends[cfg["name"]] = backend
         return backend
 
     manager = RadioManager(
         [
             {"name": "alpha", "enabled": True, "radio_type": "sx1262", "rssi": -88, "snr": 3.5},
-            {"name": "beta", "enabled": True, "radio_type": "pymc_tcp", "rssi": -70, "snr": 9.0},
+            {
+                "name": "beta",
+                "enabled": True,
+                "radio_type": "pymc_tcp",
+                "rssi": -70,
+                "snr": 9.0,
+                "noise_floor": -108,
+            },
             {"name": "degraded", "enabled": True, "radio_type": "kiss"},
         ],
         builder=_builder,
@@ -109,6 +125,7 @@ async def test_multiplex_adapter_send_all_uses_healthy_targets_only():
     assert adapter.check_radio_health() is True
     assert adapter.get_last_rssi() == -70
     assert adapter.get_last_snr() == 9.0
+    assert adapter.get_noise_floor() == -108
 
 
 @pytest.mark.asyncio

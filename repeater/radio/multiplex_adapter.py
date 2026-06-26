@@ -86,6 +86,25 @@ class MultiplexRadioAdapter:
             return None
         return max(values)
 
+    def get_noise_floor(self) -> Optional[float]:
+        values = []
+        for endpoint in self.healthy_endpoints():
+            backend = endpoint.backend
+            if backend is None:
+                continue
+            getter = getattr(backend, "get_noise_floor", None)
+            if not callable(getter):
+                continue
+            try:
+                value = getter()
+            except Exception:
+                continue
+            if value is not None:
+                values.append(value)
+        if not values:
+            return None
+        return max(values)
+
     def _build_receive_wrapper(self, endpoint: RadioEndpoint) -> Callable[..., Any]:
         def _wrapper(packet: Any, *args, **kwargs):
             metadata = dict(kwargs.pop("metadata", {}) or {})
