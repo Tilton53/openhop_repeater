@@ -25,7 +25,7 @@ from repeater.companion.utils import (
     trim_companion_contacts_to_fit,
     validate_companion_config_capacity,
 )
-from repeater.config import _normalize_radios_config, resolve_storage_dir
+from repeater.config import _normalize_radios_config, _sync_legacy_radio_sections_from_radios, resolve_storage_dir
 from repeater.policy_engine import PolicyEngine
 from repeater.service_utils import get_buildroot_image_info
 
@@ -6394,14 +6394,7 @@ class APIEndpoints:
                         normalized_import = _normalize_radios_config(normalized_import)
                     except Exception as exc:
                         return self._error(f"Invalid radios import: {exc}")
-                    self.config["radios"] = normalized_import["radios"]
-                    self.config["radio"] = normalized_import.get("radio", {})
-                    self.config["radio_type"] = normalized_import.get("radio_type")
-                    for section_name in ("sx1262", "ch341", "kiss", "pymc_usb", "pymc_tcp"):
-                        if section_name in normalized_import:
-                            self.config[section_name] = normalized_import[section_name]
-                        else:
-                            self.config.pop(section_name, None)
+                    self.config.update(_sync_legacy_radio_sections_from_radios(normalized_import))
                     restart_required = True
                     updated_sections.append(section)
                     continue
@@ -6427,14 +6420,10 @@ class APIEndpoints:
                             except Exception as exc:
                                 return self._error(f"Invalid radio_type import: {exc}")
 
-                            self.config["radios"][0] = normalized_import["radios"][0]
-                            self.config["radio"] = normalized_import.get("radio", {})
-                            self.config["radio_type"] = normalized_import.get("radio_type")
-                            for section_name in ("sx1262", "ch341", "kiss", "pymc_usb", "pymc_tcp"):
-                                if section_name in normalized_import:
-                                    self.config[section_name] = normalized_import[section_name]
-                                else:
-                                    self.config.pop(section_name, None)
+                            current_config = copy.deepcopy(self.config)
+                            current_config["radios"] = normalized_import["radios"]
+                            current_config["radio_type"] = normalized_import.get("radio_type")
+                            self.config.update(_sync_legacy_radio_sections_from_radios(current_config))
                             restart_required = True
                             updated_sections.append(section)
                             continue
