@@ -1181,7 +1181,11 @@ class RepeaterHandler(BaseHandler):
                             return False
 
                     try:
-                        sent = await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
+                        send_result = self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
+                        if asyncio.iscoroutine(send_result) or isinstance(send_result, asyncio.Future):
+                            sent = await send_result
+                        else:
+                            sent = send_result
                         if not sent:
                             logger.warning(
                                 "Retransmit failed (attempt %d): dispatcher returned false",
