@@ -109,6 +109,33 @@ def _normalize_radios_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+def _sync_legacy_radio_sections_from_radios(config: Dict[str, Any]) -> Dict[str, Any]:
+    radios = config.get("radios")
+    if not isinstance(radios, list) or not radios:
+        return _normalize_radios_config(config)
+
+    normalized = _normalize_radios_config(copy.deepcopy(config))
+
+    for section_name in ("radio", "radio_type", "sx1262", "kiss", "pymc_tcp", "pymc_usb", "ch341"):
+        normalized.pop(section_name, None)
+
+    first_enabled_radio = next(
+        (radio for radio in normalized["radios"] if isinstance(radio, dict) and bool(radio.get("enabled", True))),
+        None,
+    )
+    selected_radio = first_enabled_radio or normalized["radios"][0]
+
+    normalized["radio"] = copy.deepcopy(selected_radio.get("radio", {}))
+    normalized["radio_type"] = selected_radio.get("radio_type")
+
+    for section_name in ("sx1262", "kiss", "pymc_tcp", "pymc_usb", "ch341"):
+        section_value = selected_radio.get(section_name)
+        if isinstance(section_value, dict):
+            normalized[section_name] = copy.deepcopy(section_value)
+
+    return normalized
+
+
 def _resolve_policy_config_path(config: Dict[str, Any], config_path: str) -> Path:
     policy_section = config.get("policy", {}) if isinstance(config.get("policy"), dict) else {}
     configured = policy_section.get("policy_file") or "policy.yaml"
