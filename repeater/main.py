@@ -32,6 +32,9 @@ from repeater.handler_helpers import (
 )
 from repeater.identity_manager import IdentityManager
 from repeater.packet_router import PacketRouter
+from repeater.radio.bridge_fabric import RadioBridgeFabric
+from repeater.radio.manager import RadioManager
+from repeater.radio.multiplex_adapter import MultiplexRadioAdapter
 from repeater.sensors import SensorManager
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
 
@@ -43,6 +46,8 @@ class RepeaterDaemon:
 
         self.config = config
         self.radio = radio
+        self.radio_manager = None
+        self.bridge_fabric = None
         self.dispatcher = None
         self.repeater_handler = None
         self.local_hash = None
@@ -108,31 +113,50 @@ class RepeaterDaemon:
         if self.radio is None:
             radio_type_raw = self.config.get("radio_type")
             radio_type = "none" if radio_type_raw is None else str(radio_type_raw)
-            radio_type_lower = radio_type.lower().strip()
-            radio_explicitly_disabled = radio_type_lower in (
-                "",
-                "none",
-                "null",
-                "disabled",
-                "off",
-                "no_radio",
+            logger.info(
+                "Initializing radio hardware... (%d configured endpoint(s))",
+                len(self.config.get("radios") or []),
             )
-            logger.info(f"Initializing radio hardware... (radio_type={radio_type})")
             try:
-                self.radio = get_radio_for_board(self.config)
+                self.radio_manager = RadioManager.from_config(self.config)
+                self.radio_manager.initialize_all()
+                healthy_endpoints = self.radio_manager.healthy_endpoints()
 
-                if isinstance(self.radio, NullRadio):
-                    self.radio_status = "disabled" if radio_explicitly_disabled else "degraded"
-                    if self.radio_status == "disabled":
-                        self.radio_error = None
-                    else:
-                        self.radio_error = (
+                if healthy_endpoints:
+                    self.radio = MultiplexRadioAdapter(self.radio_manager)
+                    self.bridge_fabric = RadioBridgeFabric(self.radio_manager)
+                    enabled_endpoints = [e for e in self.radio_manager.endpoints if e.enabled]
+                    failed_names = [
+                        endpoint.name
+                        for endpoint in enabled_endpoints
+                        if endpoint.state.value != "ready"
+                    ]
+                    self.radio_status = "ok" if not failed_names else "degraded"
+                    self.radio_error = (
+                        None
+                        if not failed_names
+                        else f"Some radios failed to start: {', '.join(failed_names)}"
+                    )
+                else:
+                    self.radio = get_radio_for_board(self.config)
+                    radio_type_lower = radio_type.lower().strip()
+                    radio_explicitly_disabled = radio_type_lower in (
+                        "",
+                        "none",
+                        "null",
+                        "disabled",
+                        "off",
+                        "no_radio",
+                    )
+                    if isinstance(self.radio, NullRadio):
+                        self.radio_status = "disabled" if radio_explicitly_disabled else "degraded"
+                        self.radio_error = None if radio_explicitly_disabled else (
                             self.radio_error
                             or f"Radio type '{radio_type}' unavailable; running in no-radio mode"
                         )
-                else:
-                    self.radio_status = "ok"
-                    self.radio_error = None
+                    else:
+                        self.radio_status = "ok"
+                        self.radio_error = None
 
                 # KISS modem: schedule RX callbacks on the event loop for thread safety
                 if hasattr(self.radio, "set_event_loop"):
@@ -1024,6 +1048,28 @@ class RepeaterDaemon:
         """
         if self.router:
             try:
+                if self.bridge_fabric:
+                    metadata = getattr(packet, "_router_metadata", {}) or {}
+                    decision = self.bridge_fabric.build_decision(
+                        packet,
+                        origin_radio=metadata.get("origin_radio"),
+                        metadata=metadata,
+                    )
+                    packet._router_metadata = decision.metadata
+
+                    if self.repeater_handler and decision.is_duplicate:
+                        self.repeater_handler.record_duplicate(
+                            packet,
+                            rssi=decision.metadata.get("rssi", getattr(packet, "_rssi", 0) or 0),
+                            snr=decision.metadata.get("snr", getattr(packet, "_snr", 0.0) or 0.0),
+                        )
+
+                    if self.radio and hasattr(self.radio, "send_via"):
+                        for endpoint_id in decision.target_endpoint_ids:
+                            await self.radio.send_via(endpoint_id, packet, wait_for_ack=False)
+
+                    if not self.bridge_fabric.should_deliver_to_router(decision):
+                        return
                 await self.router.enqueue(packet)
             except Exception as e:
                 logger.error(f"Error enqueuing packet in router: {e}", exc_info=True)
@@ -1071,6 +1117,8 @@ class RepeaterDaemon:
         stats["radio_status"] = self.radio_status
         if self.radio_error:
             stats["radio_error"] = self.radio_error
+        if self.radio_manager:
+            stats["radios"] = [endpoint.to_dict() for endpoint in self.radio_manager.endpoints]
 
         return stats
 
@@ -1324,6 +1372,12 @@ class RepeaterDaemon:
             logger.warning(f"Error closing storage: {e}")
 
         # Release radio resources
+        if self.radio_manager:
+            try:
+                self.radio_manager.shutdown_all()
+            except Exception as e:
+                logger.warning(f"Error shutting down radio endpoints: {e}")
+
         if self.radio and hasattr(self.radio, "cleanup"):
             try:
                 self.radio.cleanup()

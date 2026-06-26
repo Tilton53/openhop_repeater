@@ -271,13 +271,16 @@ class PacketRouter:
                 pass
         await self.queue.put(packet)
 
+    def _packet_metadata(self, packet) -> dict:
+        metadata = dict(getattr(packet, "_router_metadata", {}) or {})
+        metadata.setdefault("rssi", getattr(packet, "rssi", getattr(packet, "_rssi", 0)))
+        metadata.setdefault("snr", getattr(packet, "snr", getattr(packet, "_snr", 0.0)))
+        metadata.setdefault("timestamp", getattr(packet, "timestamp", 0))
+        return metadata
+
     async def inject_packet(self, packet, wait_for_ack: bool = False, origin_hash=None):
         try:
-            metadata = {
-                "rssi": getattr(packet, "rssi", 0),
-                "snr": getattr(packet, "snr", 0.0),
-                "timestamp": getattr(packet, "timestamp", 0),
-            }
+            metadata = self._packet_metadata(packet)
 
             # Serialize injects so one local TX completes before the next runs
             # (avoids duty-cycle or dispatcher races where a later packet goes out first)
@@ -390,11 +393,7 @@ class PacketRouter:
 
         payload_type = packet.get_payload_type()
         processed_by_injection = False
-        metadata = {
-            "rssi": getattr(packet, "rssi", 0),
-            "snr": getattr(packet, "snr", 0.0),
-            "timestamp": getattr(packet, "timestamp", 0),
-        }
+        metadata = self._packet_metadata(packet)
 
         # Route to specific handlers for parsing only
         if payload_type == TraceHandler.payload_type():

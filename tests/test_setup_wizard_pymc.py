@@ -115,6 +115,9 @@ def test_wizard_pymc_usb_defaults(wizard_env):
     assert written["pymc_usb"]["lbt_max_attempts"] == 5
     assert written["radio"]["tx_power"] == 22
     assert written["radio"]["preamble_length"] == 16
+    assert written["radios"][0]["name"] == "radio1"
+    assert written["radios"][0]["radio_type"] == "pymc_usb"
+    assert written["radios"][0]["pymc_usb"]["port"] == "/dev/ttyACM0"
     # config.py rejects pymc_usb if 'sx1262' / 'ch341' keys leak in — none here.
     assert "sx1262" not in written
 
@@ -163,6 +166,8 @@ def test_wizard_pymc_tcp_placeholder(wizard_env):
     assert written["pymc_tcp"]["token"] == ""
     assert written["pymc_tcp"]["connect_timeout"] == 5.0
     assert written["pymc_tcp"]["lbt_enabled"] is True
+    assert written["radios"][0]["radio_type"] == "pymc_tcp"
+    assert written["radios"][0]["pymc_tcp"]["host"] == "REPLACE_WITH_MODEM_HOST"
     # token deliberately stripped from response.
     assert "pymc_tcp_token" not in result["config"]
 
@@ -205,6 +210,7 @@ def test_wizard_kiss_branch_unchanged(wizard_env, tmp_path):
     assert written["radio_type"] == "kiss"
     assert written["kiss"]["port"] == "/dev/ttyUSB0"
     assert written["kiss"]["baud_rate"] == 115200
+    assert written["radios"][0]["kiss"]["port"] == "/dev/ttyUSB0"
 
 
 def test_wizard_rejected_after_setup_complete(wizard_env):

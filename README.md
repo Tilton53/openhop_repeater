@@ -219,6 +219,65 @@ sudo ./manage.sh
 sudo systemctl restart openhop-repeater
 ```
 
+### Multi-radio configuration
+
+The daemon now accepts normalized [`radios`](repeater/config.py:66) entries in addition to the legacy top-level [`radio_type`](config.yaml.example) and [`radio`](config.yaml.example) sections. Legacy fields are still preserved for compatibility, and the first configured radio remains mirrored to the top level so older setup/import/export flows continue to work.
+
+Example mixed local + modem configuration:
+
+```yaml
+radio_type: sx1262
+radio:
+  frequency: 869618000
+  bandwidth: 62500
+  spreading_factor: 8
+  coding_rate: 8
+  tx_power: 14
+  preamble_length: 32
+
+radios:
+  - name: local-sx1262
+    enabled: true
+    radio_type: sx1262
+    radio:
+      frequency: 869618000
+      bandwidth: 62500
+      spreading_factor: 8
+      coding_rate: 8
+      tx_power: 14
+      preamble_length: 32
+    sx1262:
+      bus_id: 0
+      cs_id: 0
+      cs_pin: 21
+      reset_pin: 18
+      busy_pin: 20
+      irq_pin: 16
+      txen_pin: -1
+      rxen_pin: -1
+
+  - name: remote-modem
+    enabled: true
+    radio_type: pymc_tcp
+    radio:
+      frequency: 915000000
+      bandwidth: 125000
+      spreading_factor: 9
+      coding_rate: 5
+      tx_power: 22
+      preamble_length: 16
+    pymc_tcp:
+      host: modem.local
+      port: 5055
+      token: ""
+```
+
+Notes:
+
+- Keep the legacy primary [`radio_type`](config.yaml.example) / [`radio`](config.yaml.example) populated; import/export and setup still use them as the compatibility mirror for the first radio.
+- API stats now include configured [`radios`](repeater/config.py:66) plus runtime endpoint state when a radio manager is active.
+- The setup wizard still creates a single primary radio, but it now writes the matching first [`radios`](repeater/config.py:66) entry so later multi-radio edits round-trip cleanly.
+
 ### Optional pyMC_Glass Integration
 
 openHop Repeater supports an optional `glass` configuration section for
