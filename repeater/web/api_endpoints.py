@@ -332,6 +332,25 @@ class APIEndpoints:
         radio_type = "" if radio_type_raw is None else str(radio_type_raw).lower().strip()
         radio_not_configured = radio_type in ("", "none", "null", "disabled", "off", "no_radio")
 
+        radios = config.get("radios")
+        if isinstance(radios, list) and radios:
+            configured_enabled_radios = 0
+            for radio_entry in radios:
+                if not isinstance(radio_entry, dict):
+                    continue
+                entry_type_raw = radio_entry.get("radio_type")
+                entry_type = "" if entry_type_raw is None else str(entry_type_raw).lower().strip()
+                if entry_type in ("kiss-modem",):
+                    entry_type = "kiss"
+                if entry_type in ("", "none", "null", "disabled", "off", "no_radio"):
+                    continue
+                if not bool(radio_entry.get("enabled", True)):
+                    continue
+                configured_enabled_radios += 1
+
+            if configured_enabled_radios > 0:
+                radio_not_configured = False
+
         reasons = {
             "default_name": has_default_name,
             "default_password": has_default_password,
@@ -6386,6 +6405,39 @@ class APIEndpoints:
                     restart_required = True
                     updated_sections.append(section)
                     continue
+
+                if section == "radio_type" and value is not None:
+                    normalized_radio_type = str(value).strip().lower()
+                    if normalized_radio_type == "kiss-modem":
+                        value = "kiss"
+
+                    current_radios = self.config.get("radios")
+                    if isinstance(current_radios, list) and current_radios:
+                        current_first_radio = current_radios[0]
+                        if isinstance(current_first_radio, dict):
+                            normalized_import = {
+                                "radios": [json.loads(json.dumps(current_first_radio))],
+                                "radio_type": value,
+                            }
+                            for legacy_key in ("radio", "sx1262", "ch341", "kiss", "pymc_usb", "pymc_tcp"):
+                                if legacy_key in self.config:
+                                    normalized_import[legacy_key] = json.loads(json.dumps(self.config.get(legacy_key)))
+                            try:
+                                normalized_import = _normalize_radios_config(normalized_import)
+                            except Exception as exc:
+                                return self._error(f"Invalid radio_type import: {exc}")
+
+                            self.config["radios"][0] = normalized_import["radios"][0]
+                            self.config["radio"] = normalized_import.get("radio", {})
+                            self.config["radio_type"] = normalized_import.get("radio_type")
+                            for section_name in ("sx1262", "ch341", "kiss", "pymc_usb", "pymc_tcp"):
+                                if section_name in normalized_import:
+                                    self.config[section_name] = normalized_import[section_name]
+                                else:
+                                    self.config.pop(section_name, None)
+                            restart_required = True
+                            updated_sections.append(section)
+                            continue
 
                 if section in {
                     "radio",
