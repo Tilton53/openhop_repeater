@@ -1,6 +1,57 @@
+import sys
+import types
+
+import yaml
 import pytest
 
-from repeater.config import get_radio_for_board
+_openhop_core = types.ModuleType("openhop_core")
+_protocol = types.ModuleType("openhop_core.protocol")
+_constants = types.ModuleType("openhop_core.protocol.constants")
+_constants.PAYLOAD_TYPE_GRP_DATA = 1
+_constants.PAYLOAD_TYPE_GRP_TXT = 2
+_crypto = types.ModuleType("openhop_core.protocol.crypto")
+
+
+class _DummyCryptoUtils:
+    @staticmethod
+    def _hmac_sha256(secret, ciphertext):
+        return b"\x00" * 32
+
+    @staticmethod
+    def _aes_decrypt(key, ciphertext):
+        return b""
+
+
+_crypto.CryptoUtils = _DummyCryptoUtils
+_protocol.constants = _constants
+_protocol.crypto = _crypto
+_openhop_core.protocol = _protocol
+_hardware = types.ModuleType("openhop_core.hardware")
+_sx1262_wrapper = types.ModuleType("openhop_core.hardware.sx1262_wrapper")
+_sx1262_wrapper.SX1262Radio = None
+_tcp_radio = types.ModuleType("openhop_core.hardware.tcp_radio")
+_tcp_radio.TCPLoRaRadio = None
+_usb_radio = types.ModuleType("openhop_core.hardware.usb_radio")
+_usb_radio.USBLoRaRadio = None
+_kiss_modem_wrapper = types.ModuleType("openhop_core.hardware.kiss_modem_wrapper")
+_kiss_modem_wrapper.KissModemWrapper = None
+_hardware.sx1262_wrapper = _sx1262_wrapper
+_hardware.tcp_radio = _tcp_radio
+_hardware.usb_radio = _usb_radio
+_hardware.kiss_modem_wrapper = _kiss_modem_wrapper
+_openhop_core.hardware = _hardware
+sys.modules.setdefault("openhop_core", _openhop_core)
+sys.modules.setdefault("openhop_core.protocol", _protocol)
+sys.modules.setdefault("openhop_core.protocol.constants", _constants)
+sys.modules.setdefault("openhop_core.protocol.crypto", _crypto)
+sys.modules.setdefault("openhop_core.hardware", _hardware)
+sys.modules.setdefault("openhop_core.hardware.sx1262_wrapper", _sx1262_wrapper)
+sys.modules.setdefault("openhop_core.hardware.tcp_radio", _tcp_radio)
+sys.modules.setdefault("openhop_core.hardware.usb_radio", _usb_radio)
+sys.modules.setdefault("openhop_core.hardware.kiss_modem_wrapper", _kiss_modem_wrapper)
+
+from repeater.config import get_radio_for_board, load_config
+from repeater.radio.manager import RadioManager
 
 
 class _DummyRadio:
@@ -8,6 +59,137 @@ class _DummyRadio:
 
     def begin(self):
         return True
+
+
+def test_load_config_normalizes_legacy_single_radio(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "radio_type": "pymc_tcp",
+                "radio": {"frequency": 915000000, "tx_power": 20},
+                "pymc_tcp": {"host": "bridge.local", "port": 5055},
+                "repeater": {},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "repeater.config._load_or_create_identity_key",
+        lambda path=None: b"0" * 32,
+    )
+
+    config = load_config(str(config_path))
+
+    assert len(config["radios"]) == 1
+    radio = config["radios"][0]
+    assert radio["name"] == "radio1"
+    assert radio["enabled"] is True
+    assert radio["radio_type"] == "pymc_tcp"
+    assert radio["pymc_tcp"]["host"] == "bridge.local"
+    assert radio["radio"]["frequency"] == 915000000
+    assert radio["radio"]["tx_power"] == 20
+    assert radio["radio"]["bandwidth"] == 62500
+    assert config["radio_type"] == "pymc_tcp"
+    assert config["radio"]["frequency"] == 915000000
+
+
+def test_load_config_preserves_explicit_radios_and_applies_defaults(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "radio_type": "sx1262",
+                "radio": {"frequency": 869618000, "tx_power": 14},
+                "radios": [
+                    {
+                        "name": "local",
+                        "radio_type": "sx1262",
+                        "sx1262": {
+                            "bus_id": 0,
+                            "cs_id": 0,
+                            "cs_pin": 21,
+                            "reset_pin": 18,
+                            "busy_pin": 20,
+                            "irq_pin": 16,
+                            "txen_pin": -1,
+                            "rxen_pin": -1,
+                        },
+                    },
+                    {
+                        "radio_type": "pymc_tcp",
+                        "enabled": False,
+                        "pymc_tcp": {"host": "modem.local"},
+                        "radio": {"tx_power": 22, "preamble_length": 16},
+                    },
+                ],
+                "repeater": {},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "repeater.config._load_or_create_identity_key",
+        lambda path=None: b"1" * 32,
+    )
+
+    config = load_config(str(config_path))
+
+    assert [radio["name"] for radio in config["radios"]] == ["local", "radio2"]
+    assert config["radios"][0]["enabled"] is True
+    assert config["radios"][1]["enabled"] is False
+    assert config["radios"][0]["radio"]["frequency"] == 869618000
+    assert config["radios"][0]["radio"]["bandwidth"] == 62500
+    assert config["radios"][1]["radio"]["frequency"] == 869618000
+    assert config["radios"][1]["radio"]["tx_power"] == 22
+    assert config["radios"][1]["radio"]["preamble_length"] == 16
+
+
+def test_radio_manager_from_config_uses_normalized_radios(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "radios": [
+                    {
+                        "name": "local",
+                        "radio_type": "sx1262",
+                        "sx1262": {
+                            "bus_id": 0,
+                            "cs_id": 0,
+                            "cs_pin": 21,
+                            "reset_pin": 18,
+                            "busy_pin": 20,
+                            "irq_pin": 16,
+                            "txen_pin": -1,
+                            "rxen_pin": -1,
+                        },
+                    },
+                    {
+                        "radio_type": "pymc_tcp",
+                        "pymc_tcp": {"host": "modem.local"},
+                    },
+                ],
+                "repeater": {},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "repeater.config._load_or_create_identity_key",
+        lambda path=None: b"2" * 32,
+    )
+
+    config = load_config(str(config_path))
+    manager = RadioManager.from_config(config, builder=lambda cfg: _DummyRadio())
+    initialized = manager.initialize_all()
+
+    assert [endpoint.name for endpoint in manager.endpoints] == ["local", "radio2"]
+    assert [endpoint.name for endpoint in initialized] == ["local", "radio2"]
+    assert manager.summary().ready == 2
 
 
 def test_get_radio_for_board_passes_en_pins(monkeypatch):
@@ -62,6 +244,34 @@ def test_get_radio_for_board_null_radio_type_returns_null_radio():
 def test_get_radio_for_board_missing_radio_type_returns_null_radio():
     radio = get_radio_for_board({})
     assert type(radio).__name__ == "NullRadio"
+
+
+def test_get_radio_for_board_uses_default_radio_values_for_per_radio_entry(monkeypatch):
+    captured = {}
+
+    class _DummyTCPLoRaRadio(_DummyRadio):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "openhop_core.hardware.tcp_radio.TCPLoRaRadio",
+        _DummyTCPLoRaRadio,
+    )
+
+    get_radio_for_board(
+        {
+            "name": "remote",
+            "radio_type": "pymc_tcp",
+            "pymc_tcp": {"host": "modem.local"},
+        }
+    )
+
+    assert captured["frequency"] == 869618000
+    assert captured["bandwidth"] == 62500
+    assert captured["spreading_factor"] == 8
+    assert captured["coding_rate"] == 8
+    assert captured["tx_power"] == 14
+    assert captured["preamble_length"] == 32
 
 
 # ─── pymc_tcp / pymc_usb branches ────────────────────────────────────

@@ -680,9 +680,21 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         daemon.companion_bridges = {0x01: b1}
         router = PacketRouter(daemon)
         pkt = _make_packet(GroupTextHandler.payload_type())
+        pkt._router_metadata = {
+            "origin_radio": "alpha",
+            "bridge_tx_targets": ["beta"],
+            "bridged": True,
+        }
         await router._route_packet(pkt)
         b1.process_received_packet.assert_awaited_once()
         daemon.repeater_handler.assert_awaited_once()
+        routed_metadata = daemon.repeater_handler.await_args.args[1]
+        assert routed_metadata["origin_radio"] == "alpha"
+        assert routed_metadata["bridge_tx_targets"] == ["beta"]
+        assert routed_metadata["bridged"] is True
+        assert "rssi" in routed_metadata
+        assert "snr" in routed_metadata
+        assert "timestamp" in routed_metadata
 
 
 class TestInjectedTxRawEcho(unittest.IsolatedAsyncioTestCase):

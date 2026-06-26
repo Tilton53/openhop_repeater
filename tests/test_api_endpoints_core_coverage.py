@@ -374,6 +374,41 @@ def test_config_export_full_backup_includes_hex_keys(cherrypy_ctx):
     assert result["data"]["meta"]["includes_secrets"] is True
 
 
+def test_config_export_preserves_normalized_radios(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "GET"
+
+    api = _make_api(
+        {
+            "radio_type": "sx1262",
+            "radio": {"frequency": 869618000, "bandwidth": 62500, "spreading_factor": 8, "coding_rate": 8, "tx_power": 14, "preamble_length": 32},
+            "radios": [
+                {
+                    "name": "local",
+                    "enabled": True,
+                    "radio_type": "sx1262",
+                    "radio": {"frequency": 869618000, "bandwidth": 62500, "spreading_factor": 8, "coding_rate": 8, "tx_power": 14, "preamble_length": 32},
+                    "sx1262": {"bus_id": 0},
+                },
+                {
+                    "name": "remote",
+                    "enabled": False,
+                    "radio_type": "pymc_tcp",
+                    "radio": {"frequency": 915000000, "bandwidth": 125000, "spreading_factor": 9, "coding_rate": 5, "tx_power": 22, "preamble_length": 16},
+                    "pymc_tcp": {"host": "modem.local", "port": 5055},
+                },
+            ],
+        }
+    )
+
+    result = api.config_export()
+
+    assert result["success"] is True
+    exported_radios = result["data"]["config"]["radios"]
+    assert [radio["name"] for radio in exported_radios] == ["local", "remote"]
+    assert exported_radios[1]["pymc_tcp"]["host"] == "modem.local"
+
+
 def test_config_import_rejects_missing_config_object(cherrypy_ctx):
     request, _ = cherrypy_ctx
     request.method = "POST"
@@ -445,6 +480,42 @@ def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
     assert api.config["repeater"]["identity_key"] == bytes.fromhex("AABBCC")
     assert "identity_file" not in api.config["repeater"]
     assert api.config["identities"]["companions"][0]["identity_key"] == bytes.fromhex("C0FFEE")
+
+
+def test_config_import_radios_normalizes_legacy_top_level_fields(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    api = _make_api(
+        {
+            "radio_type": "sx1262",
+            "radio": {"frequency": 869618000, "bandwidth": 62500, "spreading_factor": 8, "coding_rate": 8, "tx_power": 14, "preamble_length": 32},
+            "sx1262": {"bus_id": 0, "cs_id": 0, "cs_pin": 8, "reset_pin": 25, "busy_pin": 24, "irq_pin": 16, "txen_pin": -1, "rxen_pin": -1},
+        }
+    )
+    api.config_manager.update_and_save.return_value = {"ok": True}
+    api.config_manager.save_to_file.return_value = True
+    request.json = {
+        "config": {
+            "radios": [
+                {
+                    "name": "primary",
+                    "radio_type": "pymc_tcp",
+                    "pymc_tcp": {"host": "bridge.local", "port": 5055},
+                    "radio": {"frequency": 915000000, "bandwidth": 125000, "spreading_factor": 9, "coding_rate": 5, "tx_power": 22, "preamble_length": 16},
+                }
+            ]
+        }
+    }
+
+    result = api.config_import()
+
+    assert result["success"] is True
+    assert result["restart_required"] is True
+    assert result["sections_updated"] == ["radios"]
+    assert api.config["radio_type"] == "pymc_tcp"
+    assert api.config["radio"]["frequency"] == 915000000
+    assert api.config["radios"][0]["name"] == "primary"
+    assert api.config["pymc_tcp"]["host"] == "bridge.local"
 
 
 def test_openapi_success_sets_content_type(cherrypy_ctx):
@@ -816,6 +887,130 @@ kiss:
     assert result["data"]["summary"]["error_count"] == 0
 
 
+def test_validate_config_accepts_multi_radio_entries(cherrypy_ctx, tmp_path):
+    request, _ = cherrypy_ctx
+    request.method = "GET"
+    api = _make_api()
+    api._config_path = str(tmp_path / "config.yaml")
+    (tmp_path / "config.yaml").write_text(
+        """
+repeater:
+  node_name: mesh-node-multi
+  security:
+    admin_password: supersecret
+radio_type: sx1262
+radio:
+  frequency: 869618000
+  bandwidth: 62500
+  spreading_factor: 8
+  coding_rate: 8
+  tx_power: 14
+  preamble_length: 32
+sx1262:
+  bus_id: 0
+  cs_id: 0
+  cs_pin: 8
+  reset_pin: 25
+  busy_pin: 24
+  irq_pin: 16
+  txen_pin: -1
+  rxen_pin: -1
+radios:
+  - name: local
+    radio_type: sx1262
+    sx1262:
+      bus_id: 0
+      cs_id: 0
+      cs_pin: 8
+      reset_pin: 25
+      busy_pin: 24
+      irq_pin: 16
+      txen_pin: -1
+      rxen_pin: -1
+    radio:
+      frequency: 869618000
+      bandwidth: 62500
+      spreading_factor: 8
+      coding_rate: 8
+      tx_power: 14
+      preamble_length: 32
+  - name: remote
+    radio_type: pymc_tcp
+    pymc_tcp:
+      host: modem.local
+      port: 5055
+    radio:
+      frequency: 915000000
+      bandwidth: 125000
+      spreading_factor: 9
+      coding_rate: 5
+      tx_power: 22
+      preamble_length: 16
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = api.validate_config()
+
+    assert result["success"] is True
+    assert result["data"]["valid"] is True
+
+
+def test_validate_config_reports_invalid_multi_radio_entry(cherrypy_ctx, tmp_path):
+    request, _ = cherrypy_ctx
+    request.method = "GET"
+    api = _make_api()
+    api._config_path = str(tmp_path / "config.yaml")
+    (tmp_path / "config.yaml").write_text(
+        """
+repeater:
+  node_name: mesh-node-multi-bad
+  security:
+    admin_password: supersecret
+radio_type: sx1262
+radio:
+  frequency: 869618000
+  bandwidth: 62500
+  spreading_factor: 8
+  coding_rate: 8
+  tx_power: 14
+  preamble_length: 32
+sx1262:
+  bus_id: 0
+  cs_id: 0
+  cs_pin: 8
+  reset_pin: 25
+  busy_pin: 24
+  irq_pin: 16
+  txen_pin: -1
+  rxen_pin: -1
+radios:
+  - name: remote
+    radio_type: pymc_tcp
+    pymc_tcp:
+      host: REPLACE_WITH_MODEM_HOST
+      port: 70000
+    radio:
+      frequency: 915000000
+      bandwidth: 12345
+      spreading_factor: 9
+      coding_rate: 5
+      tx_power: 22
+      preamble_length: 16
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = api.validate_config()
+
+    assert result["success"] is True
+    assert result["data"]["valid"] is False
+    paths = {e["path"] for e in result["data"]["errors"]}
+    assert "radios[0].pymc_tcp.host" in paths
+    assert "radios[0].pymc_tcp.port" in paths
+    assert "radios[0].radio.bandwidth" in paths
+
+
 def test_validate_config_disabled_radio_warns_but_valid(cherrypy_ctx, tmp_path):
     request, _ = cherrypy_ctx
     request.method = "GET"
@@ -1185,6 +1380,33 @@ def test_stats_includes_versions_and_buildroot_image_info(cherrypy_ctx):
     assert out["version"]
     assert out["image_name"] == "pyMC"
     assert out["image_version"] == "1.2.3"
+
+
+def test_stats_includes_runtime_radio_status_from_manager(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api(
+        {
+            "radio_type": "sx1262",
+            "radios": [
+                {"name": "alpha", "enabled": True, "radio_type": "sx1262", "radio": {}},
+                {"name": "beta", "enabled": False, "radio_type": "pymc_tcp", "radio": {}},
+            ],
+        }
+    )
+    api.stats_getter = lambda: {"uptime": 5}
+    api.daemon_instance = SimpleNamespace(
+        radio_manager=SimpleNamespace(
+            endpoints=[
+                SimpleNamespace(to_dict=lambda: {"endpoint_id": "alpha", "name": "alpha", "state": "ready"}),
+                SimpleNamespace(to_dict=lambda: {"endpoint_id": "beta", "name": "beta", "state": "failed", "last_error": "offline"}),
+            ]
+        )
+    )
+
+    out = api.stats()
+
+    assert out["radios"][0]["runtime"]["state"] == "ready"
+    assert out["radios"][1]["runtime"]["last_error"] == "offline"
 
 
 def test_gps_snapshot_when_service_present_and_default_when_absent(cherrypy_ctx):

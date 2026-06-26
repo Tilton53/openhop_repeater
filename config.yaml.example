@@ -406,6 +406,46 @@ radio:
   # Use implicit header mode
   implicit_header: false
 
+# Optional multi-radio configuration. When present, the daemon normalizes this
+# list and keeps the first enabled entry mirrored into the legacy top-level
+# radio/radio_type transport sections for compatibility with older flows.
+# Keep top-level radio/radio_type populated for import/export compatibility and
+# for tooling that still expects a primary radio.
+# radios:
+#   - name: "local-sx1262"
+#     enabled: true
+#     radio_type: sx1262
+#     radio:
+#       frequency: 869618000
+#       bandwidth: 62500
+#       spreading_factor: 8
+#       coding_rate: 8
+#       tx_power: 14
+#       preamble_length: 32
+#     sx1262:
+#       bus_id: 0
+#       cs_id: 0
+#       cs_pin: 21
+#       reset_pin: 18
+#       busy_pin: 20
+#       irq_pin: 16
+#       txen_pin: -1
+#       rxen_pin: -1
+#   - name: "remote-modem"
+#     enabled: true
+#     radio_type: pymc_tcp
+#     radio:
+#       frequency: 915000000
+#       bandwidth: 125000
+#       spreading_factor: 9
+#       coding_rate: 5
+#       tx_power: 22
+#       preamble_length: 16
+#     pymc_tcp:
+#       host: "modem.local"
+#       port: 5055
+#       token: ""
+
 # KISS modem (when radio_type: kiss). Requires openhop-core with KISS support.
 # kiss:
 #   port: "/dev/ttyUSB0"

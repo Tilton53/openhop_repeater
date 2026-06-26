@@ -76,6 +76,75 @@ def test_get_stats_includes_public_key_gps_sensors_and_radio_state():
     assert stats["radio_error"] == "missing device"
 
 
+def test_get_stats_includes_per_radio_endpoint_details():
+    daemon = RepeaterDaemon(_base_config(), radio=object())
+    daemon.radio_manager = SimpleNamespace(
+        endpoints=[
+            SimpleNamespace(to_dict=lambda: {"endpoint_id": "alpha", "name": "alpha", "state": "ready"}),
+            SimpleNamespace(to_dict=lambda: {"endpoint_id": "beta", "name": "beta", "state": "failed"}),
+        ]
+    )
+
+    stats = daemon.get_stats()
+
+    assert stats["radios"] == [
+        {"endpoint_id": "alpha", "name": "alpha", "state": "ready"},
+        {"endpoint_id": "beta", "name": "beta", "state": "failed"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_router_callback_uses_bridge_fabric_for_dedup_and_fanout():
+    packet = SimpleNamespace(_router_metadata={"origin_radio": "alpha", "rssi": -90, "snr": 2.5})
+    daemon = RepeaterDaemon(_base_config(), radio=SimpleNamespace(send_via=AsyncMock()))
+    daemon.router = SimpleNamespace(enqueue=AsyncMock())
+    daemon.repeater_handler = SimpleNamespace(record_duplicate=MagicMock())
+    daemon.bridge_fabric = SimpleNamespace(
+        build_decision=MagicMock(
+            return_value=SimpleNamespace(
+                metadata={
+                    "origin_radio": "alpha",
+                    "bridge_tx_targets": ["beta", "gamma"],
+                    "rssi": -90,
+                    "snr": 2.5,
+                },
+                is_duplicate=False,
+                target_endpoint_ids=["beta", "gamma"],
+            )
+        ),
+        should_deliver_to_router=MagicMock(return_value=True),
+    )
+
+    await daemon._router_callback(packet)
+
+    daemon.radio.send_via.assert_any_await("beta", packet, wait_for_ack=False)
+    daemon.radio.send_via.assert_any_await("gamma", packet, wait_for_ack=False)
+    daemon.router.enqueue.assert_awaited_once_with(packet)
+
+
+@pytest.mark.asyncio
+async def test_router_callback_drops_duplicate_after_recording_it():
+    packet = SimpleNamespace(_router_metadata={"origin_radio": "alpha", "rssi": -71, "snr": 1.25})
+    daemon = RepeaterDaemon(_base_config(), radio=SimpleNamespace(send_via=AsyncMock()))
+    daemon.router = SimpleNamespace(enqueue=AsyncMock())
+    daemon.repeater_handler = SimpleNamespace(record_duplicate=MagicMock())
+    daemon.bridge_fabric = SimpleNamespace(
+        build_decision=MagicMock(
+            return_value=SimpleNamespace(
+                metadata={"rssi": -71, "snr": 1.25},
+                is_duplicate=True,
+                target_endpoint_ids=[],
+            )
+        ),
+        should_deliver_to_router=MagicMock(return_value=False),
+    )
+
+    await daemon._router_callback(packet)
+
+    daemon.repeater_handler.record_duplicate.assert_called_once_with(packet, rssi=-71, snr=1.25)
+    daemon.router.enqueue.assert_not_awaited()
+
+
 def test_detect_container_from_proc_env_and_fallback_path():
     with patch("builtins.open", MagicMock()) as open_mock:
         open_mock.return_value.__enter__.return_value.read.return_value = b"container=docker"
@@ -296,6 +365,7 @@ def test_signal_shutdown_idempotence_and_task_cancel():
 async def test_shutdown_stops_components_and_handles_errors():
     daemon = RepeaterDaemon(_base_config(), radio=SimpleNamespace(cleanup=MagicMock()))
     daemon.config["radio_type"] = "none"
+    daemon.radio_manager = SimpleNamespace(shutdown_all=MagicMock())
 
     frame_server = SimpleNamespace(stop=AsyncMock())
     bridge = SimpleNamespace(stop=AsyncMock())
@@ -313,6 +383,7 @@ async def test_shutdown_stops_components_and_handles_errors():
     frame_server.stop.assert_awaited_once()
     bridge.stop.assert_awaited_once()
     daemon.router.stop.assert_awaited_once()
+    daemon.radio_manager.shutdown_all.assert_called_once()
     daemon.radio.cleanup.assert_called_once()
 
 

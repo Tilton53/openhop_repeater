@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -25,7 +26,7 @@ from repeater.companion.utils import (
     trim_companion_contacts_to_fit,
     validate_companion_config_capacity,
 )
-from repeater.config import resolve_storage_dir
+from repeater.config import _normalize_radios_config, _sync_legacy_radio_sections_from_radios, resolve_storage_dir
 from repeater.policy_engine import PolicyEngine
 from repeater.service_utils import get_buildroot_image_info
 
@@ -332,12 +333,206 @@ class APIEndpoints:
         radio_type = "" if radio_type_raw is None else str(radio_type_raw).lower().strip()
         radio_not_configured = radio_type in ("", "none", "null", "disabled", "off", "no_radio")
 
+        radios = config.get("radios")
+        if isinstance(radios, list) and radios:
+            configured_enabled_radios = 0
+            for radio_entry in radios:
+                if not isinstance(radio_entry, dict):
+                    continue
+                entry_type_raw = radio_entry.get("radio_type")
+                entry_type = "" if entry_type_raw is None else str(entry_type_raw).lower().strip()
+                if entry_type in ("kiss-modem",):
+                    entry_type = "kiss"
+                if entry_type in ("", "none", "null", "disabled", "off", "no_radio"):
+                    continue
+                if not bool(radio_entry.get("enabled", True)):
+                    continue
+                configured_enabled_radios += 1
+
+            if configured_enabled_radios > 0:
+                radio_not_configured = False
+
         reasons = {
             "default_name": has_default_name,
             "default_password": has_default_password,
             "radio_not_configured": radio_not_configured,
         }
         return has_default_name or has_default_password or radio_not_configured, reasons
+
+    @staticmethod
+    def _radio_transport_section_name(radio_type) -> Optional[str]:
+        if radio_type is None:
+            return None
+        normalized = str(radio_type).strip().lower()
+        if normalized == "kiss-modem":
+            normalized = "kiss"
+        return normalized if normalized in {"sx1262", "sx1262_ch341", "kiss", "pymc_tcp", "pymc_usb"} else None
+
+    def _prepare_runtime_radio_status(self):
+        configured_radios = self.config.get("radios")
+        if not isinstance(configured_radios, list):
+            configured_radios = []
+
+        runtime_by_id = {}
+        radio_manager = getattr(getattr(self.daemon_instance, "radio_manager", None), "endpoints", None)
+        if isinstance(radio_manager, list):
+            for endpoint in radio_manager:
+                try:
+                    endpoint_data = endpoint.to_dict()
+                except Exception:
+                    continue
+                endpoint_id = endpoint_data.get("endpoint_id") or endpoint_data.get("name")
+                if endpoint_id:
+                    runtime_by_id[str(endpoint_id)] = endpoint_data
+
+        fallback_status = getattr(self.daemon_instance, "radio_status", None)
+        fallback_error = getattr(self.daemon_instance, "radio_error", None)
+        radios = []
+        for index, radio in enumerate(configured_radios):
+            if not isinstance(radio, dict):
+                continue
+            entry = json.loads(json.dumps(radio))
+            name = entry.get("name") or f"radio{index + 1}"
+            runtime = runtime_by_id.get(str(name))
+            if runtime is None and index == 0 and not runtime_by_id:
+                runtime = {
+                    "endpoint_id": name,
+                    "name": name,
+                    "state": fallback_status or ("disabled" if not entry.get("enabled", True) else "unknown"),
+                    "last_error": fallback_error,
+                }
+            if runtime is not None:
+                entry["runtime"] = runtime
+            radios.append(entry)
+        return radios
+
+    def _apply_setup_radio_choice(self, config_yaml: dict, data: dict, hw_config: dict, radio_preset: dict):
+        if "radio" not in config_yaml or not isinstance(config_yaml.get("radio"), dict):
+            config_yaml["radio"] = {}
+
+        freq_mhz = float(radio_preset.get("frequency", 0))
+        bw_khz = float(radio_preset.get("bandwidth", 0))
+        config_yaml["radio"]["frequency"] = int(freq_mhz * 1000000)
+        config_yaml["radio"]["spreading_factor"] = int(radio_preset.get("spreading_factor", 7))
+        config_yaml["radio"]["bandwidth"] = int(bw_khz * 1000)
+        config_yaml["radio"]["coding_rate"] = int(radio_preset.get("coding_rate", 5))
+
+        tx_power_raw = radio_preset.get("tx_power")
+        tx_power_preset = None
+        if tx_power_raw not in (None, ""):
+            try:
+                tx_power_preset = int(tx_power_raw)
+            except (TypeError, ValueError):
+                raise ValueError("TX power must be an integer")
+            if tx_power_preset < -9 or tx_power_preset > 22:
+                raise ValueError("TX power must be between -9 and +22 dBm")
+
+        hardware_key = data.get("hardware_key", "").strip()
+        if hardware_key == "kiss":
+            config_yaml["radio_type"] = "kiss"
+            kiss_port = (data.get("kiss_port") or "").strip() or "/dev/ttyUSB0"
+            kiss_baud = int(data.get("kiss_baud_rate", data.get("kiss_baud", 115200)))
+            config_yaml["kiss"] = {"port": kiss_port, "baud_rate": kiss_baud}
+            config_yaml["radio"]["tx_power"] = tx_power_preset if tx_power_preset is not None else 14
+            config_yaml["radio"].setdefault("preamble_length", 32)
+        elif hardware_key == "pymc_usb":
+            config_yaml["radio_type"] = "pymc_usb"
+            usb_port = (data.get("pymc_usb_port") or "").strip() or "/dev/ttyACM0"
+            usb_baud = int(data.get("pymc_usb_baudrate", data.get("pymc_usb_baud", 921600)))
+            pymc_usb_section = config_yaml.setdefault("pymc_usb", {})
+            pymc_usb_section["port"] = usb_port
+            pymc_usb_section["baudrate"] = usb_baud
+            pymc_usb_section.setdefault("lbt_enabled", True)
+            pymc_usb_section.setdefault("lbt_max_attempts", 5)
+            if tx_power_preset is not None:
+                config_yaml["radio"]["tx_power"] = tx_power_preset
+            elif "tx_power" in hw_config:
+                config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
+            if "preamble_length" in hw_config:
+                config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 32)
+        elif hardware_key == "pymc_tcp":
+            config_yaml["radio_type"] = "pymc_tcp"
+            tcp_host = (data.get("pymc_tcp_host") or "").strip() or "REPLACE_WITH_MODEM_HOST"
+            tcp_port = int(data.get("pymc_tcp_port", 5055))
+            pymc_tcp_section = config_yaml.setdefault("pymc_tcp", {})
+            pymc_tcp_section["host"] = tcp_host
+            pymc_tcp_section["port"] = tcp_port
+            tcp_token = data.get("pymc_tcp_token")
+            if tcp_token is not None:
+                pymc_tcp_section["token"] = str(tcp_token)
+            else:
+                pymc_tcp_section.setdefault("token", "")
+            pymc_tcp_section.setdefault("connect_timeout", 5.0)
+            pymc_tcp_section.setdefault("lbt_enabled", True)
+            pymc_tcp_section.setdefault("lbt_max_attempts", 5)
+            if tx_power_preset is not None:
+                config_yaml["radio"]["tx_power"] = tx_power_preset
+            elif "tx_power" in hw_config:
+                config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
+            if "preamble_length" in hw_config:
+                config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 32)
+        else:
+            config_yaml["radio_type"] = hw_config.get("radio_type", "sx1262")
+            ch341_cfg = hw_config.get("ch341") if isinstance(hw_config.get("ch341"), dict) else None
+            vid = (ch341_cfg or {}).get("vid", hw_config.get("vid"))
+            pid = (ch341_cfg or {}).get("pid", hw_config.get("pid"))
+            if vid is not None or pid is not None:
+                config_yaml.setdefault("ch341", {})
+                if vid is not None:
+                    config_yaml["ch341"]["vid"] = vid
+                if pid is not None:
+                    config_yaml["ch341"]["pid"] = pid
+            if tx_power_preset is not None:
+                config_yaml["radio"]["tx_power"] = tx_power_preset
+            elif "tx_power" in hw_config:
+                config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
+            if "preamble_length" in hw_config:
+                config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 32)
+            config_yaml.setdefault("sx1262", {})
+            for key in (
+                "bus_id",
+                "cs_id",
+                "reset_pin",
+                "busy_pin",
+                "irq_pin",
+                "txen_pin",
+                "rxen_pin",
+                "en_pin",
+                "en_pins",
+                "cs_pin",
+                "txled_pin",
+                "rxled_pin",
+                "use_dio3_tcxo",
+                "dio3_tcxo_voltage",
+                "use_dio2_rf",
+                "is_waveshare",
+                "gpio_chip",
+                "use_gpiod_backend",
+            ):
+                if key in hw_config:
+                    config_yaml["sx1262"][key] = hw_config[key]
+
+        config_yaml.setdefault("radios", [])
+        if not config_yaml["radios"]:
+            config_yaml["radios"].append({})
+        first_radio = config_yaml["radios"][0]
+        if not isinstance(first_radio, dict):
+            first_radio = {}
+            config_yaml["radios"][0] = first_radio
+        first_radio.setdefault("name", data.get("radio_name") or "radio1")
+        first_radio["enabled"] = bool(first_radio.get("enabled", True))
+        first_radio["radio_type"] = config_yaml.get("radio_type")
+        first_radio["radio"] = json.loads(json.dumps(config_yaml.get("radio", {})))
+        transport = self._radio_transport_section_name(config_yaml.get("radio_type"))
+        for section_name in ("sx1262", "kiss", "pymc_tcp", "pymc_usb", "ch341"):
+            if isinstance(config_yaml.get(section_name), dict) and (
+                section_name == transport
+                or (section_name == "ch341" and config_yaml.get("radio_type") == "sx1262_ch341")
+            ):
+                first_radio[section_name] = json.loads(json.dumps(config_yaml[section_name]))
+            else:
+                first_radio.pop(section_name, None)
+        return freq_mhz
 
     def _default_policy_document(self) -> dict:
         return {
@@ -1199,156 +1394,12 @@ class APIEndpoints:
                 config_yaml["repeater"]["security"] = {}
             config_yaml["repeater"]["security"]["admin_password"] = admin_password
 
-            # Update radio settings - convert MHz/kHz to Hz (used for both SX1262 and KISS modem)
-            if "radio" not in config_yaml:
-                config_yaml["radio"] = {}
-            freq_mhz = float(radio_preset.get("frequency", 0))
-            bw_khz = float(radio_preset.get("bandwidth", 0))
-            config_yaml["radio"]["frequency"] = int(freq_mhz * 1000000)
-            config_yaml["radio"]["spreading_factor"] = int(radio_preset.get("spreading_factor", 7))
-            config_yaml["radio"]["bandwidth"] = int(bw_khz * 1000)
-            config_yaml["radio"]["coding_rate"] = int(radio_preset.get("coding_rate", 5))
+            try:
+                freq_mhz = self._apply_setup_radio_choice(config_yaml, data, hw_config, radio_preset)
+            except ValueError as e:
+                return {"success": False, "error": str(e)}
 
-            tx_power_raw = radio_preset.get("tx_power")
-            tx_power_preset = None
-            if tx_power_raw not in (None, ""):
-                try:
-                    tx_power_preset = int(tx_power_raw)
-                except (TypeError, ValueError):
-                    return {"success": False, "error": "TX power must be an integer"}
-                if tx_power_preset < -9 or tx_power_preset > 22:
-                    return {
-                        "success": False,
-                        "error": "TX power must be between -9 and +22 dBm",
-                    }
-
-            if hardware_key == "kiss":
-                # KISS modem: set radio_type and kiss section (port/baud from request or defaults)
-                config_yaml["radio_type"] = "kiss"
-                kiss_port = (data.get("kiss_port") or "").strip() or "/dev/ttyUSB0"
-                kiss_baud = int(data.get("kiss_baud_rate", data.get("kiss_baud", 115200)))
-                config_yaml["kiss"] = {"port": kiss_port, "baud_rate": kiss_baud}
-                config_yaml["radio"]["tx_power"] = (
-                    tx_power_preset if tx_power_preset is not None else 14
-                )
-                if "preamble_length" not in config_yaml["radio"]:
-                    config_yaml["radio"]["preamble_length"] = 32
-            elif hardware_key == "pymc_usb":
-                # pymc_usb modem: external SX1262 board over USB-CDC.
-                # Accept pymc_usb_port / pymc_usb_baudrate from the request body
-                # (mirrors the KISS pattern) so a future SPA can expose inputs;
-                # fall back to /dev/ttyACM0 at 921600 baud, which matches the
-                # firmware default and the typical USB-CDC modem device on Linux.
-                config_yaml["radio_type"] = "pymc_usb"
-                usb_port = (data.get("pymc_usb_port") or "").strip() or "/dev/ttyACM0"
-                usb_baud = int(data.get("pymc_usb_baudrate", data.get("pymc_usb_baud", 921600)))
-                pymc_usb_section = config_yaml.setdefault("pymc_usb", {})
-                pymc_usb_section["port"] = usb_port
-                pymc_usb_section["baudrate"] = usb_baud
-                pymc_usb_section.setdefault("lbt_enabled", True)
-                pymc_usb_section.setdefault("lbt_max_attempts", 5)
-                if tx_power_preset is not None:
-                    config_yaml["radio"]["tx_power"] = tx_power_preset
-                elif "tx_power" in hw_config:
-                    config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
-                if "preamble_length" in hw_config:
-                    config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 32)
-            elif hardware_key == "pymc_tcp":
-                # pymc_tcp modem: external SX1262 board exposed as TCP over Wi-Fi/Ethernet.
-                # 'host' has no sensible default — must be the modem's LAN address or
-                # mDNS name. Accept it from the request body if the SPA provides it,
-                # otherwise write a clearly-placeholder hostname so the file is valid
-                # YAML and the user gets a startup error pointing them at the right
-                # section to edit (see config.py: ValueError 'Missing host …').
-                config_yaml["radio_type"] = "pymc_tcp"
-                tcp_host = (data.get("pymc_tcp_host") or "").strip() or "REPLACE_WITH_MODEM_HOST"
-                tcp_port = int(data.get("pymc_tcp_port", 5055))
-                pymc_tcp_section = config_yaml.setdefault("pymc_tcp", {})
-                pymc_tcp_section["host"] = tcp_host
-                pymc_tcp_section["port"] = tcp_port
-                tcp_token = data.get("pymc_tcp_token")
-                if tcp_token is not None:
-                    pymc_tcp_section["token"] = str(tcp_token)
-                else:
-                    pymc_tcp_section.setdefault("token", "")
-                pymc_tcp_section.setdefault("connect_timeout", 5.0)
-                pymc_tcp_section.setdefault("lbt_enabled", True)
-                pymc_tcp_section.setdefault("lbt_max_attempts", 5)
-                if tx_power_preset is not None:
-                    config_yaml["radio"]["tx_power"] = tx_power_preset
-                elif "tx_power" in hw_config:
-                    config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
-                if "preamble_length" in hw_config:
-                    config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 32)
-            else:
-                # SX1262 / sx1262_ch341: radio_type and optional CH341 from hw_config
-                if "radio_type" in hw_config:
-                    config_yaml["radio_type"] = hw_config.get("radio_type")
-                else:
-                    config_yaml["radio_type"] = "sx1262"
-
-                ch341_cfg = (
-                    hw_config.get("ch341") if isinstance(hw_config.get("ch341"), dict) else None
-                )
-                vid = (ch341_cfg or {}).get("vid", hw_config.get("vid"))
-                pid = (ch341_cfg or {}).get("pid", hw_config.get("pid"))
-                if vid is not None or pid is not None:
-                    if "ch341" not in config_yaml:
-                        config_yaml["ch341"] = {}
-                    if vid is not None:
-                        config_yaml["ch341"]["vid"] = vid
-                    if pid is not None:
-                        config_yaml["ch341"]["pid"] = pid
-
-                if tx_power_preset is not None:
-                    config_yaml["radio"]["tx_power"] = tx_power_preset
-                elif "tx_power" in hw_config:
-                    config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
-                if "preamble_length" in hw_config:
-                    config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 32)
-
-                if "sx1262" not in config_yaml:
-                    config_yaml["sx1262"] = {}
-                if "bus_id" in hw_config:
-                    config_yaml["sx1262"]["bus_id"] = hw_config.get("bus_id", 0)
-                if "cs_id" in hw_config:
-                    config_yaml["sx1262"]["cs_id"] = hw_config.get("cs_id", 0)
-                if "reset_pin" in hw_config:
-                    config_yaml["sx1262"]["reset_pin"] = hw_config.get("reset_pin", 22)
-                if "busy_pin" in hw_config:
-                    config_yaml["sx1262"]["busy_pin"] = hw_config.get("busy_pin", 17)
-                if "irq_pin" in hw_config:
-                    config_yaml["sx1262"]["irq_pin"] = hw_config.get("irq_pin", 16)
-                if "txen_pin" in hw_config:
-                    config_yaml["sx1262"]["txen_pin"] = hw_config.get("txen_pin", -1)
-                if "rxen_pin" in hw_config:
-                    config_yaml["sx1262"]["rxen_pin"] = hw_config.get("rxen_pin", -1)
-                if "en_pin" in hw_config:
-                    config_yaml["sx1262"]["en_pin"] = hw_config.get("en_pin", -1)
-                if "en_pins" in hw_config:
-                    config_yaml["sx1262"]["en_pins"] = hw_config.get("en_pins", [])
-                if "cs_pin" in hw_config:
-                    config_yaml["sx1262"]["cs_pin"] = hw_config.get("cs_pin", -1)
-                if "txled_pin" in hw_config:
-                    config_yaml["sx1262"]["txled_pin"] = hw_config.get("txled_pin", -1)
-                if "rxled_pin" in hw_config:
-                    config_yaml["sx1262"]["rxled_pin"] = hw_config.get("rxled_pin", -1)
-                if "use_dio3_tcxo" in hw_config:
-                    config_yaml["sx1262"]["use_dio3_tcxo"] = hw_config.get("use_dio3_tcxo", False)
-                if "dio3_tcxo_voltage" in hw_config:
-                    config_yaml["sx1262"]["dio3_tcxo_voltage"] = hw_config.get(
-                        "dio3_tcxo_voltage", 1.8
-                    )
-                if "use_dio2_rf" in hw_config:
-                    config_yaml["sx1262"]["use_dio2_rf"] = hw_config.get("use_dio2_rf", False)
-                if "is_waveshare" in hw_config:
-                    config_yaml["sx1262"]["is_waveshare"] = hw_config.get("is_waveshare", False)
-                if "gpio_chip" in hw_config:
-                    config_yaml["sx1262"]["gpio_chip"] = hw_config.get("gpio_chip", 0)
-                if "use_gpiod_backend" in hw_config:
-                    config_yaml["sx1262"]["use_gpiod_backend"] = hw_config.get(
-                        "use_gpiod_backend", False
-                    )
+            config_yaml = _normalize_radios_config(config_yaml)
             # Write updated config
             with open(self._config_path, "w") as f:
                 yaml.dump(config_yaml, f, default_flow_style=False, sort_keys=False)
@@ -1425,6 +1476,7 @@ class APIEndpoints:
             stats["kiss"] = self.config.get("kiss", {})
             stats["pymc_usb"] = self.config.get("pymc_usb", {})
             stats["pymc_tcp"] = self.config.get("pymc_tcp", {})
+            stats["radios"] = self._prepare_runtime_radio_status()
             stats["site_name"] = self.config.get("web", {}).get("site_name", "")
             stats["version"] = __version__
             try:
@@ -2241,6 +2293,78 @@ class APIEndpoints:
                     add_error(path, "must be a number")
                     return None
 
+            def validate_radio_common(radio_entry: dict, path_prefix: str):
+                frequency = as_float(radio_entry.get("frequency"), f"{path_prefix}.frequency")
+                if frequency is None:
+                    add_error(f"{path_prefix}.frequency", "Frequency is required")
+                elif frequency < 100_000_000 or frequency > 1_000_000_000:
+                    add_error(f"{path_prefix}.frequency", "Frequency must be 100-1000 MHz")
+
+                bandwidth = as_int(radio_entry.get("bandwidth"), f"{path_prefix}.bandwidth")
+                valid_bw = [7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000]
+                if bandwidth is None:
+                    add_error(f"{path_prefix}.bandwidth", "Bandwidth is required")
+                elif bandwidth not in valid_bw:
+                    add_error(
+                        f"{path_prefix}.bandwidth",
+                        f"Bandwidth must be one of {[b / 1000 for b in valid_bw]} kHz",
+                    )
+
+                spreading_factor = as_int(radio_entry.get("spreading_factor"), f"{path_prefix}.spreading_factor")
+                if spreading_factor is None:
+                    add_error(f"{path_prefix}.spreading_factor", "Spreading factor is required")
+                elif spreading_factor < 5 or spreading_factor > 12:
+                    add_error(f"{path_prefix}.spreading_factor", "Spreading factor must be 5-12")
+
+                coding_rate = as_int(radio_entry.get("coding_rate"), f"{path_prefix}.coding_rate")
+                if coding_rate is None:
+                    add_error(f"{path_prefix}.coding_rate", "Coding rate is required")
+                elif coding_rate < 5 or coding_rate > 8:
+                    add_error(f"{path_prefix}.coding_rate", "Coding rate must be 5-8 (for 4/5 to 4/8)")
+
+                tx_power = as_int(radio_entry.get("tx_power"), f"{path_prefix}.tx_power")
+                if tx_power is None:
+                    add_error(f"{path_prefix}.tx_power", "TX power is required")
+                elif tx_power < -9 or tx_power > 30:
+                    add_error(f"{path_prefix}.tx_power", "TX power must be between -9 and +30 dBm")
+
+                preamble_length = as_int(radio_entry.get("preamble_length"), f"{path_prefix}.preamble_length")
+                if preamble_length is None:
+                    add_error(f"{path_prefix}.preamble_length", "Preamble length is required")
+                elif preamble_length <= 0:
+                    add_error(f"{path_prefix}.preamble_length", "Preamble length must be greater than zero")
+
+            def validate_sx1262_section(sx1262_cfg: dict, path_prefix: str):
+                required_sx1262_keys = [
+                    "bus_id",
+                    "cs_id",
+                    "cs_pin",
+                    "reset_pin",
+                    "busy_pin",
+                    "irq_pin",
+                    "txen_pin",
+                    "rxen_pin",
+                ]
+                for key in required_sx1262_keys:
+                    value = sx1262_cfg.get(key) if isinstance(sx1262_cfg, dict) else None
+                    parsed = as_int(value, f"{path_prefix}.{key}")
+                    if parsed is None:
+                        add_error(
+                            f"{path_prefix}.{key}", f"Missing or invalid required setting '{key}'"
+                        )
+
+                en_pins = sx1262_cfg.get("en_pins") if isinstance(sx1262_cfg, dict) else None
+                if en_pins is not None:
+                    if not isinstance(en_pins, list):
+                        add_error(f"{path_prefix}.en_pins", "en_pins must be a list of integers")
+                    else:
+                        for idx, pin in enumerate(en_pins):
+                            if as_int(pin, f"{path_prefix}.en_pins[{idx}]") is None:
+                                add_error(
+                                    f"{path_prefix}.en_pins[{idx}]",
+                                    "Each en_pins entry must be an integer",
+                                )
+
             try:
                 with open(self._config_path, "r", encoding="utf-8") as f:
                     config_yaml = yaml.safe_load(f)
@@ -2289,6 +2413,12 @@ class APIEndpoints:
                 if not str(admin_password).strip():
                     add_error("repeater.security.admin_password", "Admin password is required")
 
+                normalized_config = None
+                try:
+                    normalized_config = _normalize_radios_config(copy.deepcopy(config_yaml))
+                except Exception as exc:
+                    add_error("radios", f"Invalid radios configuration: {exc}")
+
                 radio_type_raw = config_yaml.get("radio_type")
                 radio_type = "" if radio_type_raw is None else str(radio_type_raw).strip().lower()
                 if radio_type == "kiss-modem":
@@ -2315,68 +2445,80 @@ class APIEndpoints:
 
                 radio_disabled = radio_type in ("", "none", "null", "disabled", "off", "no_radio")
                 radio = config_yaml.get("radio")
+                radios = normalized_config.get("radios", []) if isinstance(normalized_config, dict) else []
 
                 if not radio_disabled:
                     if not isinstance(radio, dict):
                         add_error("radio", "Missing required section 'radio'")
                         radio = {}
 
-                    frequency = as_float((radio or {}).get("frequency"), "radio.frequency")
-                    if frequency is None:
-                        add_error("radio.frequency", "Frequency is required")
-                    elif frequency < 100_000_000 or frequency > 1_000_000_000:
-                        add_error("radio.frequency", "Frequency must be 100-1000 MHz")
+                    validate_radio_common(radio or {}, "radio")
 
-                    bandwidth = as_int((radio or {}).get("bandwidth"), "radio.bandwidth")
-                    valid_bw = [
-                        7800,
-                        10400,
-                        15600,
-                        20800,
-                        31250,
-                        41700,
-                        62500,
-                        125000,
-                        250000,
-                        500000,
-                    ]
-                    if bandwidth is None:
-                        add_error("radio.bandwidth", "Bandwidth is required")
-                    elif bandwidth not in valid_bw:
-                        add_error(
-                            "radio.bandwidth",
-                            f"Bandwidth must be one of {[b / 1000 for b in valid_bw]} kHz",
-                        )
+                    for index, radio_entry in enumerate(radios):
+                        path_prefix = f"radios[{index}]"
+                        if not isinstance(radio_entry, dict):
+                            add_error(path_prefix, "Radio entry must be a mapping")
+                            continue
+                        entry_radio_type = str(radio_entry.get("radio_type") or "").strip().lower()
+                        if entry_radio_type == "kiss-modem":
+                            entry_radio_type = "kiss"
+                        if entry_radio_type not in known_radio_types:
+                            add_error(
+                                f"{path_prefix}.radio_type",
+                                "Unsupported radio_type. Supported: sx1262, sx1262_ch341, kiss, pymc_tcp, pymc_usb, none/null",
+                            )
+                            continue
+                        if entry_radio_type in ("", "none", "null", "disabled", "off", "no_radio"):
+                            continue
+                        entry_radio = radio_entry.get("radio")
+                        if not isinstance(entry_radio, dict):
+                            add_error(f"{path_prefix}.radio", "Missing required section 'radio'")
+                            entry_radio = {}
+                        validate_radio_common(entry_radio, f"{path_prefix}.radio")
 
-                    spreading_factor = as_int(
-                        (radio or {}).get("spreading_factor"), "radio.spreading_factor"
-                    )
-                    if spreading_factor is None:
-                        add_error("radio.spreading_factor", "Spreading factor is required")
-                    elif spreading_factor < 5 or spreading_factor > 12:
-                        add_error("radio.spreading_factor", "Spreading factor must be 5-12")
-
-                    coding_rate = as_int((radio or {}).get("coding_rate"), "radio.coding_rate")
-                    if coding_rate is None:
-                        add_error("radio.coding_rate", "Coding rate is required")
-                    elif coding_rate < 5 or coding_rate > 8:
-                        add_error("radio.coding_rate", "Coding rate must be 5-8 (for 4/5 to 4/8)")
-
-                    tx_power = as_int((radio or {}).get("tx_power"), "radio.tx_power")
-                    if tx_power is None:
-                        add_error("radio.tx_power", "TX power is required")
-                    elif tx_power < -9 or tx_power > 30:
-                        add_error("radio.tx_power", "TX power must be between -9 and +30 dBm")
-
-                    preamble_length = as_int(
-                        (radio or {}).get("preamble_length"), "radio.preamble_length"
-                    )
-                    if preamble_length is None:
-                        add_error("radio.preamble_length", "Preamble length is required")
-                    elif preamble_length <= 0:
-                        add_error(
-                            "radio.preamble_length", "Preamble length must be greater than zero"
-                        )
+                        if entry_radio_type in ("sx1262", "sx1262_ch341"):
+                            sx1262_entry = radio_entry.get("sx1262")
+                            if not isinstance(sx1262_entry, dict):
+                                add_error(f"{path_prefix}.sx1262", "Missing required section 'sx1262'")
+                            else:
+                                validate_sx1262_section(sx1262_entry, f"{path_prefix}.sx1262")
+                            if entry_radio_type == "sx1262_ch341" and not isinstance(radio_entry.get("ch341"), dict):
+                                add_error(f"{path_prefix}.ch341", "Missing required section 'ch341'")
+                        elif entry_radio_type == "kiss":
+                            kiss_entry = radio_entry.get("kiss")
+                            if not isinstance(kiss_entry, dict):
+                                add_error(f"{path_prefix}.kiss", "Missing required section 'kiss'")
+                            else:
+                                if not str((kiss_entry.get("port") or "")).strip():
+                                    add_error(f"{path_prefix}.kiss.port", "KISS port is required")
+                                baud = as_int((kiss_entry or {}).get("baud_rate"), f"{path_prefix}.kiss.baud_rate")
+                                if baud is None:
+                                    add_error(f"{path_prefix}.kiss.baud_rate", "KISS baud_rate is required")
+                        elif entry_radio_type == "pymc_usb":
+                            usb_entry = radio_entry.get("pymc_usb")
+                            if not isinstance(usb_entry, dict):
+                                add_error(f"{path_prefix}.pymc_usb", "Missing required section 'pymc_usb'")
+                            else:
+                                if not str((usb_entry.get("port") or "")).strip():
+                                    add_error(f"{path_prefix}.pymc_usb.port", "pymc_usb.port is required")
+                        elif entry_radio_type == "pymc_tcp":
+                            tcp_entry = radio_entry.get("pymc_tcp")
+                            if not isinstance(tcp_entry, dict):
+                                add_error(f"{path_prefix}.pymc_tcp", "Missing required section 'pymc_tcp'")
+                            else:
+                                host_str = str((tcp_entry.get("host") or "")).strip()
+                                if not host_str:
+                                    add_error(f"{path_prefix}.pymc_tcp.host", "pymc_tcp.host is required")
+                                elif host_str == "REPLACE_WITH_MODEM_HOST":
+                                    add_error(
+                                        f"{path_prefix}.pymc_tcp.host",
+                                        "Replace placeholder host with your modem hostname or IP",
+                                    )
+                                port = as_int((tcp_entry or {}).get("port"), f"{path_prefix}.pymc_tcp.port")
+                                if port is None:
+                                    add_error(f"{path_prefix}.pymc_tcp.port", "pymc_tcp.port is required")
+                                elif port < 1 or port > 65535:
+                                    add_error(f"{path_prefix}.pymc_tcp.port", "pymc_tcp.port must be 1-65535")
 
                 if radio_type in ("sx1262", "sx1262_ch341"):
                     sx1262_cfg = config_yaml.get("sx1262")
@@ -2384,35 +2526,7 @@ class APIEndpoints:
                         add_error("sx1262", "Missing required section 'sx1262'")
                         sx1262_cfg = {}
 
-                    required_sx1262_keys = [
-                        "bus_id",
-                        "cs_id",
-                        "cs_pin",
-                        "reset_pin",
-                        "busy_pin",
-                        "irq_pin",
-                        "txen_pin",
-                        "rxen_pin",
-                    ]
-                    for key in required_sx1262_keys:
-                        value = sx1262_cfg.get(key) if isinstance(sx1262_cfg, dict) else None
-                        parsed = as_int(value, f"sx1262.{key}")
-                        if parsed is None:
-                            add_error(
-                                f"sx1262.{key}", f"Missing or invalid required setting '{key}'"
-                            )
-
-                    en_pins = sx1262_cfg.get("en_pins") if isinstance(sx1262_cfg, dict) else None
-                    if en_pins is not None:
-                        if not isinstance(en_pins, list):
-                            add_error("sx1262.en_pins", "en_pins must be a list of integers")
-                        else:
-                            for idx, pin in enumerate(en_pins):
-                                if as_int(pin, f"sx1262.en_pins[{idx}]") is None:
-                                    add_error(
-                                        f"sx1262.en_pins[{idx}]",
-                                        "Each en_pins entry must be an integer",
-                                    )
+                    validate_sx1262_section(sx1262_cfg, "sx1262")
 
                 if radio_type == "sx1262_ch341":
                     ch341_cfg = config_yaml.get("ch341")
@@ -6223,6 +6337,7 @@ class APIEndpoints:
                 "kiss",
                 "pymc_usb",
                 "pymc_tcp",
+                "radios",
                 "identities",
                 "delays",
                 "web",
@@ -6271,6 +6386,49 @@ class APIEndpoints:
                                 existing = cur_by_name.get(entry.get("name"), {})
                                 entry["identity_key"] = existing.get("identity_key", "")
 
+                if section == "radios" and isinstance(value, list):
+                    normalized_import = {"radios": copy.deepcopy(value)}
+                    for legacy_key in ("radio", "radio_type", "sx1262", "ch341", "kiss", "pymc_usb", "pymc_tcp"):
+                        if legacy_key in self.config:
+                            normalized_import[legacy_key] = copy.deepcopy(self.config.get(legacy_key))
+                    try:
+                        normalized_import = _normalize_radios_config(normalized_import)
+                    except Exception as exc:
+                        return self._error(f"Invalid radios import: {exc}")
+                    self.config.update(_sync_legacy_radio_sections_from_radios(normalized_import))
+                    restart_required = True
+                    updated_sections.append(section)
+                    continue
+
+                if section == "radio_type" and value is not None:
+                    normalized_radio_type = str(value).strip().lower()
+                    if normalized_radio_type == "kiss-modem":
+                        value = "kiss"
+
+                    current_radios = self.config.get("radios")
+                    if isinstance(current_radios, list) and current_radios:
+                        current_first_radio = current_radios[0]
+                        if isinstance(current_first_radio, dict):
+                            normalized_import = {
+                                "radios": [copy.deepcopy(current_first_radio)],
+                                "radio_type": value,
+                            }
+                            for legacy_key in ("radio", "sx1262", "ch341", "kiss", "pymc_usb", "pymc_tcp"):
+                                if legacy_key in self.config:
+                                    normalized_import[legacy_key] = copy.deepcopy(self.config.get(legacy_key))
+                            try:
+                                normalized_import = _normalize_radios_config(normalized_import)
+                            except Exception as exc:
+                                return self._error(f"Invalid radio_type import: {exc}")
+
+                            current_config = copy.deepcopy(self.config)
+                            current_config["radios"] = normalized_import["radios"]
+                            current_config["radio_type"] = normalized_import.get("radio_type")
+                            self.config.update(_sync_legacy_radio_sections_from_radios(current_config))
+                            restart_required = True
+                            updated_sections.append(section)
+                            continue
+
                 if section in {
                     "radio",
                     "sx1262",
@@ -6279,6 +6437,7 @@ class APIEndpoints:
                     "pymc_usb",
                     "pymc_tcp",
                     "radio_type",
+                    "radios",
                 }:
                     restart_required = True
 

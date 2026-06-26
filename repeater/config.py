@@ -1,4 +1,5 @@
 import base64
+import copy
 import logging
 import os
 from pathlib import Path
@@ -9,6 +10,130 @@ import yaml
 from repeater.policy_engine import default_policy_engine_config
 
 logger = logging.getLogger("Config")
+
+_DEFAULT_RADIO_CONFIG = {
+    "frequency": 869618000,
+    "bandwidth": 62500,
+    "spreading_factor": 8,
+    "coding_rate": 8,
+    "tx_power": 14,
+    "preamble_length": 32,
+}
+
+
+def _normalize_single_radio_config(
+    radio_entry: Any,
+    *,
+    index: int,
+    fallback_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    if radio_entry is None:
+        radio_entry = {}
+    if not isinstance(radio_entry, dict):
+        raise ValueError(f"Radio entry at index {index} must be a mapping")
+
+    normalized = copy.deepcopy(radio_entry)
+
+    name = normalized.get("name")
+    if name is None or str(name).strip() == "":
+        normalized["name"] = f"radio{index + 1}"
+    else:
+        normalized["name"] = str(name)
+
+    enabled = normalized.get("enabled")
+    normalized["enabled"] = True if enabled is None else bool(enabled)
+
+    radio_type = normalized.get("radio_type")
+    if radio_type is None:
+        radio_type = fallback_config.get("radio_type")
+    normalized["radio_type"] = radio_type
+
+    per_radio_cfg = normalized.get("radio")
+    if per_radio_cfg is None:
+        per_radio_cfg = fallback_config.get("radio", {})
+    elif not isinstance(per_radio_cfg, dict):
+        raise ValueError(f"Radio entry at index {index} has non-mapping 'radio' section")
+
+    merged_radio_cfg = copy.deepcopy(_DEFAULT_RADIO_CONFIG)
+    if isinstance(fallback_config.get("radio"), dict):
+        merged_radio_cfg.update(copy.deepcopy(fallback_config["radio"]))
+    merged_radio_cfg.update(copy.deepcopy(per_radio_cfg if isinstance(per_radio_cfg, dict) else {}))
+    normalized["radio"] = merged_radio_cfg
+
+    return normalized
+
+
+def _normalize_radios_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    legacy_fallback = {
+        "radio_type": config.get("radio_type"),
+        "radio": config.get("radio", {}) if isinstance(config.get("radio"), dict) else {},
+    }
+
+    radios = config.get("radios")
+    if radios is None:
+        radios = [
+            {
+                "name": config.get("radio_name") or "radio1",
+                "enabled": config.get("radio_enabled", True),
+                "radio_type": config.get("radio_type"),
+                "radio": copy.deepcopy(legacy_fallback["radio"]),
+            }
+        ]
+        for section_name in ("sx1262", "kiss", "pymc_tcp", "pymc_usb", "ch341"):
+            section = config.get(section_name)
+            if isinstance(section, dict):
+                radios[0][section_name] = copy.deepcopy(section)
+    elif not isinstance(radios, list):
+        raise ValueError("Config key 'radios' must be a list")
+
+    normalized_radios = [
+        _normalize_single_radio_config(radio_entry, index=index, fallback_config=legacy_fallback)
+        for index, radio_entry in enumerate(radios)
+    ]
+
+    if not normalized_radios:
+        normalized_radios = [
+            _normalize_single_radio_config({}, index=0, fallback_config=legacy_fallback)
+        ]
+
+    config["radios"] = normalized_radios
+    config["radio"] = copy.deepcopy(normalized_radios[0]["radio"])
+    config["radio_type"] = normalized_radios[0].get("radio_type")
+
+    for section_name in ("sx1262", "kiss", "pymc_tcp", "pymc_usb", "ch341"):
+        if isinstance(normalized_radios[0].get(section_name), dict):
+            config[section_name] = copy.deepcopy(normalized_radios[0][section_name])
+        elif section_name in config:
+            del config[section_name]
+
+    return config
+
+
+def _sync_legacy_radio_sections_from_radios(config: Dict[str, Any]) -> Dict[str, Any]:
+    radios = config.get("radios")
+    if not isinstance(radios, list) or not radios:
+        return _normalize_radios_config(config)
+
+    normalized = _normalize_radios_config(copy.deepcopy(config))
+
+    for section_name in ("radio", "radio_type", "sx1262", "kiss", "pymc_tcp", "pymc_usb", "ch341"):
+        normalized.pop(section_name, None)
+
+    first_enabled_radio = next(
+        (radio for radio in normalized["radios"] if isinstance(radio, dict) and bool(radio.get("enabled", True))),
+        None,
+    )
+    selected_radio = first_enabled_radio or normalized["radios"][0]
+
+    normalized["radio"] = copy.deepcopy(selected_radio.get("radio", {}))
+    normalized["radio_type"] = selected_radio.get("radio_type")
+
+    for section_name in ("sx1262", "kiss", "pymc_tcp", "pymc_usb", "ch341"):
+        section_value = selected_radio.get(section_name)
+        if isinstance(section_value, dict):
+            normalized[section_name] = copy.deepcopy(section_value)
+
+    return normalized
 
 
 def _resolve_policy_config_path(config: Dict[str, Any], config_path: str) -> Path:
@@ -216,6 +341,8 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             logger.info(f"Loaded config from {config_path}")
     except Exception as e:
         raise RuntimeError(f"Failed to load configuration from {config_path}: {e}") from e
+
+    config = _normalize_radios_config(config)
 
     storage_dir = resolve_storage_dir(config, config_path=config_path)
     if "storage" not in config or not isinstance(config.get("storage"), dict):
@@ -439,12 +566,6 @@ def _load_or_create_identity_key(path: Optional[str] = None) -> bytes:
 
 def get_radio_for_board(board_config: dict):
 
-    @overload
-    def _parse_int(value, *, default: None = None) -> Optional[int]: ...
-
-    @overload
-    def _parse_int(value, *, default: int) -> int: ...
-
     def _parse_int(value, *, default=None):
         if value is None:
             return default
@@ -468,34 +589,19 @@ def get_radio_for_board(board_config: dict):
             return [_parse_int(item) for item in stripped.split(",") if item.strip()]
         raise ValueError(f"Invalid int list value type: {type(value)}")
 
-    radio_type_raw = board_config.get("radio_type")
-    if radio_type_raw is None:
-        radio_type = "none"
-    else:
-        radio_type = str(radio_type_raw).lower().strip()
-
-    if radio_type in ("", "none", "null", "disabled", "off", "no_radio"):
-        logger.warning("Radio disabled by configuration (radio_type=%r)", radio_type_raw)
-        return NullRadio()
-
-    if radio_type == "kiss-modem":
-        radio_type = "kiss"
-
-    if radio_type in ("sx1262", "sx1262_ch341"):
+    def _build_sx1262_radio(normalized_board_config: dict, radio_type: str):
         from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
-        # Get radio and SPI configuration - all settings must be in config file
-        spi_config = board_config.get("sx1262")
+        spi_config = normalized_board_config.get("sx1262")
         if not spi_config:
             raise ValueError("Missing 'sx1262' section in configuration file")
 
-        radio_config = board_config.get("radio")
+        radio_config = normalized_board_config.get("radio")
         if not radio_config:
             raise ValueError("Missing 'radio' section in configuration file")
 
-        # CH341 integration: swap SPI transport + GPIO backend to CH341
         if radio_type == "sx1262_ch341":
-            ch341_cfg = board_config.get("ch341")
+            ch341_cfg = normalized_board_config.get("ch341")
             if not ch341_cfg:
                 raise ValueError("Missing 'ch341' section in configuration file")
 
@@ -505,7 +611,6 @@ def get_radio_for_board(board_config: dict):
             vid = _parse_int(ch341_cfg.get("vid"), default=0x1A86)
             pid = _parse_int(ch341_cfg.get("pid"), default=0x5512)
 
-            # Create CH341 transport (also configures CH341 GPIO manager globally)
             ch341_spi = CH341SPITransport(vid=vid, pid=pid, auto_setup_gpio=True)
             set_spi_transport(ch341_spi)
 
@@ -540,8 +645,6 @@ def get_radio_for_board(board_config: dict):
         if en_pins is not None:
             combined_config["en_pins"] = en_pins
 
-        # Add optional GPIO parameters if specified in config
-        # These wont be supported by older versions of openhop_core
         if "gpio_chip" in spi_config:
             combined_config["gpio_chip"] = _parse_int(spi_config["gpio_chip"], default=0)
         if "use_gpiod_backend" in spi_config:
@@ -559,7 +662,7 @@ def get_radio_for_board(board_config: dict):
 
         return radio
 
-    elif radio_type == "kiss":
+    def _build_kiss_radio(normalized_board_config: dict):
         try:
             from openhop_core.hardware.kiss_modem_wrapper import KissModemWrapper
         except ImportError:
@@ -573,7 +676,7 @@ def get_radio_for_board(board_config: dict):
                     "Install your fork with: pip install -e /path/to/openhop-core"
                 ) from None
 
-        kiss_config = board_config.get("kiss")
+        kiss_config = normalized_board_config.get("kiss")
         if not kiss_config:
             raise ValueError("Missing 'kiss' section in configuration file for radio_type: kiss")
 
@@ -582,7 +685,7 @@ def get_radio_for_board(board_config: dict):
             raise ValueError("Missing 'port' in 'kiss' section (e.g. /dev/ttyUSB0)")
 
         baudrate = int(kiss_config.get("baud_rate", 115200))
-        radio_cfg = board_config.get("radio") or {}
+        radio_cfg = normalized_board_config.get("radio") or {}
         radio_config = {
             "frequency": int(radio_cfg.get("frequency", 869618000)),
             "bandwidth": int(radio_cfg.get("bandwidth", 62500)),
@@ -592,11 +695,6 @@ def get_radio_for_board(board_config: dict):
             "preamble_length": int(radio_cfg.get("preamble_length", 32)),
         }
 
-        # Optional KISS key-up / CSMA tuning, forwarded to the modem firmware (via
-        # SetHardware) only when present so the wrapper keeps its own defaults otherwise.
-        # For a host-managed repeater the engine already staggers retransmits, so the
-        # firmware's p-persistent CSMA backoff is usually redundant; set
-        # kiss_persistence: 255 to transmit as soon as the channel is clear.
         for _key in ("tx_delay_ms", "kiss_persistence", "kiss_slottime_ms", "kiss_txtail_ms"):
             if kiss_config.get(_key) is not None:
                 radio_config[_key] = int(kiss_config[_key])
@@ -618,7 +716,7 @@ def get_radio_for_board(board_config: dict):
 
         return radio
 
-    elif radio_type == "pymc_tcp":
+    def _build_pymc_tcp_radio(normalized_board_config: dict):
         try:
             from openhop_core.hardware.tcp_radio import TCPLoRaRadio
         except ImportError:
@@ -628,7 +726,7 @@ def get_radio_for_board(board_config: dict):
                 "Reinstall the [hardware] extra to pick it up."
             ) from None
 
-        tcp_cfg = board_config.get("pymc_tcp")
+        tcp_cfg = normalized_board_config.get("pymc_tcp")
         if not tcp_cfg:
             raise ValueError(
                 "Missing 'pymc_tcp' section in configuration file for radio_type: pymc_tcp"
@@ -638,7 +736,7 @@ def get_radio_for_board(board_config: dict):
         if not host:
             raise ValueError("Missing 'host' in 'pymc_tcp' section (modem hostname or LAN IP)")
 
-        radio_cfg = board_config.get("radio") or {}
+        radio_cfg = normalized_board_config.get("radio") or {}
         radio = TCPLoRaRadio(
             host=host,
             port=int(tcp_cfg.get("port", 5055)),
@@ -662,7 +760,7 @@ def get_radio_for_board(board_config: dict):
 
         return BaselineCrcCounterRadio(radio)
 
-    elif radio_type == "pymc_usb":
+    def _build_pymc_usb_radio(normalized_board_config: dict):
         try:
             from openhop_core.hardware.usb_radio import USBLoRaRadio
         except ImportError:
@@ -672,7 +770,7 @@ def get_radio_for_board(board_config: dict):
                 "Reinstall the [hardware] extra to pick it up."
             ) from None
 
-        usb_cfg = board_config.get("pymc_usb")
+        usb_cfg = normalized_board_config.get("pymc_usb")
         if not usb_cfg:
             raise ValueError(
                 "Missing 'pymc_usb' section in configuration file for radio_type: pymc_usb"
@@ -682,7 +780,7 @@ def get_radio_for_board(board_config: dict):
         if not port:
             raise ValueError("Missing 'port' in 'pymc_usb' section (e.g. /dev/ttyACM0)")
 
-        radio_cfg = board_config.get("radio") or {}
+        radio_cfg = normalized_board_config.get("radio") or {}
         radio = USBLoRaRadio(
             port=port,
             baudrate=int(usb_cfg.get("baudrate", 921600)),
@@ -703,6 +801,40 @@ def get_radio_for_board(board_config: dict):
             raise RuntimeError(f"Failed to initialize pymc_usb radio: {e}") from e
 
         return BaselineCrcCounterRadio(radio)
+
+    normalized_board_config = _normalize_single_radio_config(
+        board_config,
+        index=0,
+        fallback_config={
+            "radio_type": board_config.get("radio_type"),
+            "radio": board_config.get("radio", {}) if isinstance(board_config.get("radio"), dict) else {},
+        },
+    )
+
+    radio_type_raw = normalized_board_config.get("radio_type")
+    if radio_type_raw is None:
+        radio_type = "none"
+    else:
+        radio_type = str(radio_type_raw).lower().strip()
+
+    if radio_type in ("", "none", "null", "disabled", "off", "no_radio"):
+        logger.warning("Radio disabled by configuration (radio_type=%r)", radio_type_raw)
+        return NullRadio()
+
+    if radio_type == "kiss-modem":
+        radio_type = "kiss"
+
+    if radio_type in ("sx1262", "sx1262_ch341"):
+        return _build_sx1262_radio(normalized_board_config, radio_type)
+
+    elif radio_type == "kiss":
+        return _build_kiss_radio(normalized_board_config)
+
+    elif radio_type == "pymc_tcp":
+        return _build_pymc_tcp_radio(normalized_board_config)
+
+    elif radio_type == "pymc_usb":
+        return _build_pymc_usb_radio(normalized_board_config)
 
     raise RuntimeError(
         f"Unknown radio type: {radio_type}. "
