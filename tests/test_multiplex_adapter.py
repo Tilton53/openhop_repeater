@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock
 
+import pytest
+
 from repeater.radio.endpoints import RadioEndpoint, RadioEndpointState
 from repeater.radio.manager import RadioManager
 from repeater.radio.multiplex_adapter import MultiplexRadioAdapter
@@ -93,11 +95,12 @@ def test_multiplex_adapter_set_rx_callback_aliases_set_receive_callback():
     assert received[0][2]["metadata"]["origin_radio"] == "beta"
 
 
-def test_multiplex_adapter_send_all_uses_healthy_targets_only():
+@pytest.mark.asyncio
+async def test_multiplex_adapter_send_all_uses_healthy_targets_only():
     manager, backends = _manager_with_backends()
     adapter = MultiplexRadioAdapter(manager)
 
-    result = adapter.send_all("payload", wait_for_ack=False)
+    result = await adapter.send_all("payload", wait_for_ack=False)
 
     assert set(result) == {"alpha", "beta"}
     assert backends["alpha"].sent_packets == [("payload", {"wait_for_ack": False})]
@@ -108,11 +111,12 @@ def test_multiplex_adapter_send_all_uses_healthy_targets_only():
     assert adapter.get_last_snr() == 9.0
 
 
-def test_multiplex_adapter_send_via_validates_endpoint_availability():
+@pytest.mark.asyncio
+async def test_multiplex_adapter_send_via_validates_endpoint_availability():
     manager, backends = _manager_with_backends()
     adapter = MultiplexRadioAdapter(manager)
 
-    direct_result = adapter.send_via("beta", "packet", priority="high")
+    direct_result = await adapter.send_via("beta", "packet", priority="high")
 
     assert direct_result == {"packet": "packet", "kwargs": {"priority": "high"}}
     assert backends["beta"].sent_packets == [("packet", {"priority": "high"})]
@@ -127,14 +131,8 @@ def test_multiplex_adapter_send_via_validates_endpoint_availability():
     )
     manager._endpoints.append(disabled_endpoint)
 
-    try:
-        adapter.send_via("missing", "packet")
-        assert False, "Expected KeyError for unknown endpoint"
-    except KeyError:
-        pass
+    with pytest.raises(KeyError):
+        await adapter.send_via("missing", "packet")
 
-    try:
-        adapter.send_via("cold", "packet")
-        assert False, "Expected RuntimeError for uninitialized endpoint"
-    except RuntimeError:
-        pass
+    with pytest.raises(RuntimeError):
+        await adapter.send_via("cold", "packet")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from typing import Any, Callable, Dict, List, Optional
 
@@ -41,16 +42,16 @@ class MultiplexRadioAdapter:
     def set_rx_callback(self, callback: Callable[..., Any]) -> None:
         self.set_receive_callback(callback)
 
-    def send(self, packet: Any, **kwargs) -> Dict[str, Any]:
-        return self.send_all(packet, **kwargs)
+    async def send(self, packet: Any, **kwargs) -> Dict[str, Any]:
+        return await self.send_all(packet, **kwargs)
 
-    def send_all(self, packet: Any, **kwargs) -> Dict[str, Any]:
+    async def send_all(self, packet: Any, **kwargs) -> Dict[str, Any]:
         results: Dict[str, Any] = {}
         for endpoint in self.healthy_endpoints():
-            results[endpoint.endpoint_id] = self.send_via(endpoint.endpoint_id, packet, **kwargs)
+            results[endpoint.endpoint_id] = await self.send_via(endpoint.endpoint_id, packet, **kwargs)
         return results
 
-    def send_via(self, endpoint_id: str, packet: Any, **kwargs) -> Any:
+    async def send_via(self, endpoint_id: str, packet: Any, **kwargs) -> Any:
         endpoint = self.get_endpoint(endpoint_id)
         if endpoint is None:
             raise KeyError(f"Unknown radio endpoint: {endpoint_id}")
@@ -62,7 +63,10 @@ class MultiplexRadioAdapter:
             sender = getattr(endpoint.backend, "send_packet", None)
         if not callable(sender):
             raise AttributeError(f"Radio endpoint does not expose send/send_packet: {endpoint_id}")
-        return sender(packet, **kwargs)
+        result = sender(packet, **kwargs)
+        if inspect.isawaitable(result) or isinstance(result, asyncio.Future):
+            return await result
+        return result
 
     def sleep(self) -> None:
         self.manager.shutdown_all()
